@@ -131,6 +131,7 @@ celerybeat.pid
 .env
 .venv
 /.venv/
+/.venv-shardon/
 env/
 venv/
 ENV/

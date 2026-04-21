@@ -60,6 +60,12 @@ Individual services are also available:
 - Backend subprocesses inherit `HF_TOKEN`, `HF_HOME`, and the model source information when launched.
 - The admin UI now includes a guided model onboarding form and shows only whether `HF_TOKEN` is configured, never the secret itself.
 
+## Backend Health Checks
+
+- Shardon marks a backend healthy when the configured health endpoint returns a `2xx` response.
+- JSON responses are stored as health payloads as-is.
+- Non-JSON `2xx` responses (for example plain-text `/health` from some vLLM builds) are accepted and stored with status metadata instead of failing readiness.
+
 ## Runtime Operator Commands
 
 - `shardon runtime status`

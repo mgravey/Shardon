@@ -120,7 +120,19 @@ class BackendAdapter(ABC):
     async def health(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{self.backend.base_url}{self.backend.health_path}")
-            return response.json()
+            response.raise_for_status()
+            try:
+                return response.json()
+            except ValueError:
+                payload: dict[str, Any] = {
+                    "status": "ok",
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type"),
+                }
+                body_text = response.text.strip()
+                if body_text:
+                    payload["body"] = body_text
+                return payload
 
     @abstractmethod
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
