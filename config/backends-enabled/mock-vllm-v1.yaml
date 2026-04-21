@@ -1,0 +1,28 @@
+id: mock-vllm-v1
+backend_type: vllm
+version: 0.6.6
+display_name: Mock vLLM 0.6.6
+runtime_dir: demo/runtimes/mock-vllm-v1
+working_directory: demo/runtimes/mock-vllm-v1
+base_url: http://127.0.0.1:19091
+launch_command:
+  - python3
+  - launcher.py
+  - --port
+  - "19091"
+  - --runtime-label
+  - mock-vllm-v1
+health_path: /health
+environment:
+  SHARDON_BACKEND_FLAVOR: vllm
+capabilities:
+  chat: true
+  completions: true
+  embeddings: false
+  batch: true
+  openai_compatible: true
+  max_context_length: 8192
+  extra:
+    tensor_parallel: true
+    streaming: false
+

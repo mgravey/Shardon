@@ -1,0 +1,6 @@
+eviction_strategy: lru
+interactive_queue_timeout_seconds: 15
+switch_grace_window_seconds: 300
+safety_margin_fraction: 0.05
+batch_switch_policy: never_force_switch
+

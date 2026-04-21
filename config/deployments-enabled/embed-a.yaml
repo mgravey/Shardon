@@ -1,0 +1,12 @@
+id: embed-a
+model_id: demo-embed-model
+backend_runtime_id: mock-sglang
+gpu_group_id: group-a
+api_model_name: demo-embed
+display_name: Demo Embeddings / Group A
+memory_fraction: 0.35
+enabled: true
+priority_weight: 80
+tasks:
+  - embedding
+

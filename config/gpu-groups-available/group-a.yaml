@@ -1,0 +1,10 @@
+id: group-a
+display_name: Group A
+gpu_ids:
+  - gpu0
+usable_memory_fraction: 0.95
+keep_free: false
+scheduling_tags:
+  - interactive
+  - shared
+

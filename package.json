@@ -1,0 +1,13 @@
+{
+  "name": "shardon",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/admin_web"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/admin_web run dev",
+    "build:web": "npm --workspace apps/admin_web run build"
+  }
+}
+

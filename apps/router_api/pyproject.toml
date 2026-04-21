@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shardon-router-api"
+version = "0.1.0"
+description = "Inference router plane for Shardon."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "pydantic>=2.8.0",
+  "uvicorn>=0.30.0",
+  "shardon-core",
+]
+
+[project.scripts]
+shardon-router-api = "shardon_router_api.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shardon_router_api"]
+

@@ -1,0 +1,13 @@
+id: demo-chat-model
+source: /models/demo-chat-model
+display_name: Demo Chat Model
+backend_compatibility:
+  - vllm
+  - sglang
+tasks:
+  - chat
+  - completion
+tokenizer: demo-chat-tokenizer
+metadata:
+  family: demo
+

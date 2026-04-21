@@ -1,0 +1,12 @@
+instance_name: shardon-demo
+admin_host: 127.0.0.1
+admin_port: 8081
+router_host: 127.0.0.1
+router_port: 8080
+state_root: state
+switch_grace_window_seconds: 300
+default_drain_timeout_seconds: 120
+scheduler_tick_seconds: 5
+queue_poll_interval_seconds: 0.25
+default_memory_fraction: 0.9
+

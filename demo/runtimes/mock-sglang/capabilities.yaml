@@ -1,0 +1,6 @@
+chat: true
+completions: true
+embeddings: true
+batch: true
+openai_compatible: true
+
