@@ -385,6 +385,40 @@ class ShardonRuntime:
         self.event_logger.audit("runtime.unload", actor, deployment_id=deployment.id)
         return {"status": "ok", "deployment_id": deployment.id}
 
+    def clear_queue(
+        self,
+        *,
+        clear_interactive: bool = True,
+        clear_batches: bool = False,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        cleared_interactive_request_ids: list[str] = []
+        cancelled_batch_ids: list[str] = []
+
+        def mutate(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            if clear_interactive:
+                cleared_interactive_request_ids.extend([item.id for item in snapshot.queued_requests])
+                snapshot.queued_requests = []
+            if clear_batches:
+                for job in snapshot.batch_jobs.values():
+                    if job.status != "queued":
+                        continue
+                    job.status = "cancelled"
+                    job.updated_at = utc_now_iso()
+                    cancelled_batch_ids.append(job.id)
+            return snapshot
+
+        self.state_store.mutate(mutate)
+        detail = {
+            "status": "ok",
+            "cleared_interactive_requests": len(cleared_interactive_request_ids),
+            "cancelled_batch_jobs": len(cancelled_batch_ids),
+            "interactive_request_ids": cleared_interactive_request_ids,
+            "batch_job_ids": cancelled_batch_ids,
+        }
+        self.event_logger.audit("runtime.queue.cleared", actor, **detail)
+        return detail
+
     async def route_chat(
         self,
         request: ChatCompletionRequest,
@@ -440,6 +474,14 @@ class ShardonRuntime:
         last_detail: dict[str, Any] = {}
         while asyncio.get_event_loop().time() < deadline:
             snapshot = self.snapshot()
+            if not any(item.id == request_id for item in snapshot.queued_requests):
+                detail = {
+                    "error": "request cancelled",
+                    "request_id": request_id,
+                    "model_name": model_name,
+                    "task": task,
+                }
+                raise RuntimeOperationError("request cancelled", detail=detail, status_code=409)
             decision = self.scheduler.schedule(
                 SchedulingRequest(
                     model_name=model_name,
@@ -704,7 +746,13 @@ class ShardonRuntime:
         auth: AuthResult,
     ) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
-        queued = next(item for item in snapshot.queued_requests if item.id == request_id)
+        queued = next((item for item in snapshot.queued_requests if item.id == request_id), None)
+        if queued is None:
+            raise RuntimeOperationError(
+                "request cancelled",
+                detail={"error": "request cancelled", "request_id": request_id},
+                status_code=409,
+            )
         queued.deployment_id = deployment.id
         queued.backend_runtime_id = deployment.backend_runtime_id
         queued.gpu_group_id = deployment.gpu_group_id

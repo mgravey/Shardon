@@ -40,6 +40,14 @@ async def _run_async(args: argparse.Namespace) -> int:
             result = await runtime.unload_deployment(args.deployment, actor="cli")
             print(json.dumps(result, indent=2, default=str))
             return 0
+        if args.runtime_command == "clear-queue":
+            result = runtime.clear_queue(
+                clear_interactive=True,
+                clear_batches=args.batches,
+                actor="cli",
+            )
+            print(json.dumps(result, indent=2, default=str))
+            return 0
     except RuntimeOperationError as exc:
         print(json.dumps(exc.detail, indent=2, default=str))
         return 1
@@ -62,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     unload = runtime_subparsers.add_parser("unload", help="Manually unload a deployment")
     unload.add_argument("--deployment", required=True, help="Deployment id to unload")
+
+    clear_queue = runtime_subparsers.add_parser("clear-queue", help="Clear queued requests")
+    clear_queue.add_argument(
+        "--batches",
+        action="store_true",
+        help="Also cancel queued batch jobs",
+    )
 
     return parser
 

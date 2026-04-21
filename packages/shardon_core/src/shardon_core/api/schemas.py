@@ -33,6 +33,11 @@ class DrainRequest(BaseModel):
     timeout_seconds: int = 120
 
 
+class ClearQueueRequest(BaseModel):
+    interactive: bool = True
+    batches: bool = False
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str

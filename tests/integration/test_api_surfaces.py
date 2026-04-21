@@ -119,6 +119,16 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     _assert_no_missing_query_dependencies(unload_attempt, {"username", "runtime"})
     assert unload_attempt.status_code == 401
 
+    clear_queue = admin_client.post(
+        "/runtime/queue/clear",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"interactive": True, "batches": True},
+    )
+    _assert_no_missing_query_dependencies(clear_queue, {"username", "runtime"})
+    assert clear_queue.status_code == 200
+    assert "cleared_interactive_requests" in clear_queue.json()
+    assert "cancelled_batch_jobs" in clear_queue.json()
+
     onboard = admin_client.post(
         "/workflows/model-onboarding",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -183,6 +193,8 @@ def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> Non
     _assert_dep_param(_route(admin_app, "/runtime/load", "POST"), "runtime")
     _assert_dep_param(_route(admin_app, "/runtime/unload/{deployment_id}", "POST"), "username")
     _assert_dep_param(_route(admin_app, "/runtime/unload/{deployment_id}", "POST"), "runtime")
+    _assert_dep_param(_route(admin_app, "/runtime/queue/clear", "POST"), "username")
+    _assert_dep_param(_route(admin_app, "/runtime/queue/clear", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/models", "GET"), "auth")
     _assert_dep_param(_route(router_app, "/v1/models", "GET"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "auth")

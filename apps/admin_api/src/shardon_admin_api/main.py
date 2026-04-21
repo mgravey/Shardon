@@ -12,6 +12,7 @@ from shardon_core.api.schemas import (
     APIKeySecretResponse,
     AdminLoginRequest,
     AdminLoginResponse,
+    ClearQueueRequest,
     CreateAPIKeyRequest,
     DrainRequest,
     EnvironmentStatusResponse,
@@ -341,6 +342,18 @@ def create_app() -> FastAPI:
             return await runtime.unload_deployment(deployment_id, actor=username)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/queue/clear")
+    async def runtime_clear_queue(
+        payload: ClearQueueRequest,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> dict[str, Any]:
+        return runtime.clear_queue(
+            clear_interactive=payload.interactive,
+            clear_batches=payload.batches,
+            actor=username,
+        )
 
     @app.post("/workflows/model-onboarding")
     async def onboard_model(

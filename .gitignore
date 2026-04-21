@@ -133,6 +133,7 @@ celerybeat.pid
 /.venv/
 /.venv-shardon/
 /.venv-work/
+state/**/*.bak*
 env/
 venv/
 ENV/

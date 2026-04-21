@@ -73,8 +73,15 @@ Individual services are also available:
 - `shardon runtime load --deployment <id>`
 - `shardon runtime load --model <api-model> --gpu-group <group>`
 - `shardon runtime unload --deployment <id>`
+- `shardon runtime clear-queue [--batches]`
 
 These commands are intended for cold-start debugging, manual health validation, and GPU-fit checks outside routed inference traffic.
+
+Queue management notes:
+
+- `clear-queue` clears interactive queued requests from runtime state.
+- `clear-queue --batches` also cancels queued (not running) batch jobs.
+- Admin API exposes the same operation at `POST /runtime/queue/clear`.
 
 ## Documentation
 
