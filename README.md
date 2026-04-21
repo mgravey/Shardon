@@ -16,20 +16,20 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 
 ## Monorepo
 
-- [apps/admin_api](/Users/mathieugravey/projects/Shardon/apps/admin_api)
-- [apps/router_api](/Users/mathieugravey/projects/Shardon/apps/router_api)
-- [apps/admin_web](/Users/mathieugravey/projects/Shardon/apps/admin_web)
-- [packages/shardon_core](/Users/mathieugravey/projects/Shardon/packages/shardon_core)
-- [config](/Users/mathieugravey/projects/Shardon/config)
-- [state](/Users/mathieugravey/projects/Shardon/state)
-- [demo](/Users/mathieugravey/projects/Shardon/demo)
-- [docs](/Users/mathieugravey/projects/Shardon/docs)
+- [apps/admin_api](apps/admin_api)
+- [apps/router_api](apps/router_api)
+- [apps/admin_web](apps/admin_web)
+- [packages/shardon_core](packages/shardon_core)
+- [config](config)
+- [state](state)
+- [demo](demo)
+- [docs](docs)
 
 ## Quick Start
 
 1. Install Python dependencies with `uv sync`.
 2. Install frontend dependencies with `npm install`.
-3. Optional: create a repo `.env` from [.env.example](/Users/mathieugravey/projects/Shardon/.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
+3. Optional: create a repo `.env` from [.env.example](.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
 4. Start the admin API with `uv run --package shardon-admin-api shardon-admin-api`.
 5. Start the router API with `uv run --package shardon-router-api shardon-router-api`.
 6. Start the admin web UI with `npm --workspace apps/admin_web run dev`.
@@ -58,12 +58,12 @@ Default ports:
 
 ## Documentation
 
-- [Architecture](/Users/mathieugravey/projects/Shardon/docs/architecture.md)
-- [Configuration](/Users/mathieugravey/projects/Shardon/docs/configuration.md)
-- [Scheduling](/Users/mathieugravey/projects/Shardon/docs/scheduling.md)
-- [GPU Mapping](/Users/mathieugravey/projects/Shardon/docs/gpu-mapping.md)
-- [Keep-Free](/Users/mathieugravey/projects/Shardon/docs/keep-free.md)
-- [Drain](/Users/mathieugravey/projects/Shardon/docs/drain.md)
-- [Batching](/Users/mathieugravey/projects/Shardon/docs/batch.md)
-- [Debugging](/Users/mathieugravey/projects/Shardon/docs/debugging.md)
-- [Running Backends Outside Shardon](/Users/mathieugravey/projects/Shardon/docs/backends-outside-shardon.md)
+- [Architecture](docs/architecture.md)
+- [Configuration](docs/configuration.md)
+- [Scheduling](docs/scheduling.md)
+- [GPU Mapping](docs/gpu-mapping.md)
+- [Keep-Free](docs/keep-free.md)
+- [Drain](docs/drain.md)
+- [Batching](docs/batch.md)
+- [Debugging](docs/debugging.md)
+- [Running Backends Outside Shardon](docs/backends-outside-shardon.md)
