@@ -1,9 +1,12 @@
 PYTHON ?= python3
 
-.PHONY: test admin router web demo validate
+.PHONY: setup test admin router web demo validate dev
+
+setup:
+	./scripts/bootstrap.sh
 
 test:
-	uv run --package shardon-admin-api pytest
+	uv run --all-packages --group dev pytest
 
 admin:
 	uv run --package shardon-admin-api shardon-admin-api
@@ -17,6 +20,8 @@ web:
 demo:
 	./scripts/run_demo.sh
 
+dev:
+	./scripts/run-local.sh
+
 validate:
 	uv run --package shardon-admin-api python scripts/validate_config.py
-

@@ -52,6 +52,12 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     assert environment.status_code == 200
     assert environment.json()["hf_token_configured"] is True
 
+    load_attempt = admin_client.post(
+        "/runtime/load/chat-a",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert load_attempt.status_code in {200, 409}
+
     onboard = admin_client.post(
         "/workflows/model-onboarding",
         headers={"Authorization": f"Bearer {admin_token}"},

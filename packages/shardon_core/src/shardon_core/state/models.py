@@ -20,6 +20,7 @@ class ActiveRequest(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchJobState(BaseModel):
@@ -53,12 +54,20 @@ class DeploymentRuntimeState(BaseModel):
     gpu_group_id: str
     backend_runtime_id: str
     loaded: bool = False
+    state: Literal["unloaded", "starting", "ready", "stopping", "failed"] = "unloaded"
+    desired_state: Literal["loaded", "unloaded"] = "unloaded"
     loaded_at: str | None = None
+    startup_started_at: str | None = None
+    readiness_passed_at: str | None = None
     last_used_at: str | None = None
     resident_memory_fraction: float = 0.0
     active_request_ids: list[str] = Field(default_factory=list)
     keep_free_killed_at: str | None = None
     process_id: int | None = None
+    current_model_name: str | None = None
+    last_error: str | None = None
+    last_transition_reason: str | None = None
+    last_readiness_detail: dict[str, Any] = Field(default_factory=dict)
 
 
 class GPUProcessInfo(BaseModel):
@@ -85,4 +94,3 @@ class RuntimeStateSnapshot(BaseModel):
     drains: dict[str, DrainState] = Field(default_factory=dict)
     gpu_observations: dict[str, GPUObservation] = Field(default_factory=dict)
     backend_health: dict[str, dict[str, Any]] = Field(default_factory=dict)
-

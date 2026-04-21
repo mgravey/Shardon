@@ -1,13 +1,1 @@
-id: chat-b
-model_id: demo-chat-model
-backend_runtime_id: mock-vllm-v2
-gpu_group_id: group-b
-api_model_name: demo-chat
-display_name: Demo Chat / Group B
-memory_fraction: 0.9
-enabled: true
-priority_weight: 120
-tasks:
-  - chat
-  - completion
-
+../deployments-available/chat-b.yaml

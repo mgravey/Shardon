@@ -87,3 +87,9 @@ class EnvironmentStatusResponse(BaseModel):
     hf_token_configured: bool
     hf_home: str | None = None
     environment_file: str | None = None
+
+
+class RuntimeLoadRequest(BaseModel):
+    deployment_id: str | None = None
+    model_name: str | None = None
+    gpu_group_id: str | None = None

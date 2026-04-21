@@ -15,6 +15,12 @@ from shardon_core.config.schemas import BackendRuntimeConfig, DeploymentConfig
 from shardon_core.utils.time import utc_now_iso
 
 
+class BackendOperationError(RuntimeError):
+    def __init__(self, message: str, *, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 @dataclass(slots=True)
 class ManagedProcess:
     deployment_id: str
@@ -78,6 +84,11 @@ class ProcessSupervisor:
                 time.sleep(0.1)
             except OSError:
                 break
+        else:
+            try:
+                os.kill(managed.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         self.processes.pop(deployment_id, None)
 
     def kill(self, deployment_id: str) -> None:
@@ -89,6 +100,17 @@ class ProcessSupervisor:
         except ProcessLookupError:
             pass
         self.processes.pop(deployment_id, None)
+
+    def is_running(self, deployment_id: str) -> bool:
+        managed = self.processes.get(deployment_id)
+        if managed is None:
+            return False
+        try:
+            os.kill(managed.pid, 0)
+        except OSError:
+            self.processes.pop(deployment_id, None)
+            return False
+        return True
 
 
 class BackendAdapter(ABC):

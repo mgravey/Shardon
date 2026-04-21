@@ -1,10 +1,1 @@
-id: group-b
-display_name: Group B
-gpu_ids:
-  - gpu1
-usable_memory_fraction: 0.95
-keep_free: true
-scheduling_tags:
-  - keep-free
-  - exclusive
-
+../gpu-groups-available/group-b.yaml

@@ -15,6 +15,8 @@ type RuntimeData = {
   drains: Record<string, unknown>;
   deployments: Record<string, unknown>;
   gpu_observations: Record<string, unknown>;
+  gpu_groups: Record<string, unknown>;
+  backend_health: Record<string, unknown>;
 };
 
 type EnvironmentStatus = {
@@ -37,6 +39,17 @@ type ModelOnboardingForm = {
   backendRuntimeId: string;
   gpuGroupId: string;
   memoryFraction: string;
+};
+
+type DeploymentOnboardingForm = {
+  deploymentId: string;
+  modelId: string;
+  backendRuntimeId: string;
+  gpuGroupId: string;
+  apiModelName: string;
+  displayName: string;
+  memoryFraction: string;
+  tasks: Array<"chat" | "completion" | "embedding">;
 };
 
 const collections = [
@@ -77,6 +90,8 @@ export default function App() {
   const [editorId, setEditorId] = useState("");
   const [editorValue, setEditorValue] = useState("{}");
   const [drainGroupId, setDrainGroupId] = useState("");
+  const [loadDeploymentId, setLoadDeploymentId] = useState("chat-a");
+  const [unloadDeploymentId, setUnloadDeploymentId] = useState("chat-a");
   const [newKeyId, setNewKeyId] = useState("demo-key");
   const [newUserName, setNewUserName] = useState("demo-user");
   const [createdSecret, setCreatedSecret] = useState("");
@@ -94,6 +109,16 @@ export default function App() {
     backendRuntimeId: "",
     gpuGroupId: "",
     memoryFraction: "0.90",
+  });
+  const [deploymentForm, setDeploymentForm] = useState<DeploymentOnboardingForm>({
+    deploymentId: "llama-3-1-8b-instruct-b",
+    modelId: "",
+    backendRuntimeId: "",
+    gpuGroupId: "",
+    apiModelName: "llama-3.1-8b",
+    displayName: "Llama 3.1 8B / Group B",
+    memoryFraction: "0.90",
+    tasks: ["chat", "completion"],
   });
 
   const collectionKey = useMemo(() => {
@@ -161,6 +186,19 @@ export default function App() {
     }));
   }, [resources]);
 
+  useEffect(() => {
+    if (!resources) return;
+    const backendIds = Object.keys(resources.backends ?? {});
+    const gpuGroupIds = Object.keys(resources.gpu_groups ?? {});
+    const modelIds = Object.keys(resources.models ?? {});
+    setDeploymentForm((current) => ({
+      ...current,
+      modelId: current.modelId || modelIds[0] || "",
+      backendRuntimeId: current.backendRuntimeId || backendIds[0] || "",
+      gpuGroupId: current.gpuGroupId || gpuGroupIds[0] || "",
+    }));
+  }, [resources]);
+
   async function login(event: FormEvent) {
     event.preventDefault();
     const response = await fetch("/api/auth/login", {
@@ -220,6 +258,20 @@ export default function App() {
     await refresh();
   }
 
+  async function loadDeployment() {
+    if (!loadDeploymentId) return;
+    await api(`/runtime/load/${loadDeploymentId}`, token, { method: "POST" });
+    setMessage(`Loaded ${loadDeploymentId}.`);
+    await refresh();
+  }
+
+  async function unloadDeployment() {
+    if (!unloadDeploymentId) return;
+    await api(`/runtime/unload/${unloadDeploymentId}`, token, { method: "POST" });
+    setMessage(`Unloaded ${unloadDeploymentId}.`);
+    await refresh();
+  }
+
   function toggleTask(task: "chat" | "completion" | "embedding") {
     setModelForm((current) => ({
       ...current,
@@ -260,6 +312,38 @@ export default function App() {
     setMessage(`Onboarded model ${modelForm.modelId}.`);
     setCollection("models");
     setSelectedId(modelForm.modelId);
+    await refresh();
+  }
+
+  function toggleDeploymentTask(task: "chat" | "completion" | "embedding") {
+    setDeploymentForm((current) => ({
+      ...current,
+      tasks: current.tasks.includes(task)
+        ? current.tasks.filter((item) => item !== task)
+        : [...current.tasks, task],
+    }));
+  }
+
+  async function submitDeploymentOnboarding() {
+    await api(`/resources/deployments/${deploymentForm.deploymentId}`, token, {
+      method: "PUT",
+      body: JSON.stringify({
+        id: deploymentForm.deploymentId,
+        model_id: deploymentForm.modelId,
+        backend_runtime_id: deploymentForm.backendRuntimeId,
+        gpu_group_id: deploymentForm.gpuGroupId,
+        api_model_name: deploymentForm.apiModelName,
+        display_name: deploymentForm.displayName,
+        memory_fraction: Number(deploymentForm.memoryFraction),
+        enabled: true,
+        priority_weight: 100,
+        tasks: deploymentForm.tasks,
+        extra: {},
+      }),
+    });
+    setMessage(`Added deployment ${deploymentForm.deploymentId}.`);
+    setCollection("deployments");
+    setSelectedId(deploymentForm.deploymentId);
     await refresh();
   }
 
@@ -505,6 +589,111 @@ export default function App() {
 
         <article className="panel">
           <div className="panel-header">
+            <h2>Add Deployment</h2>
+            <p>Place an existing logical model onto another backend runtime or GPU group.</p>
+          </div>
+          <div className="stack">
+            <label>
+              Deployment ID
+              <input
+                value={deploymentForm.deploymentId}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, deploymentId: event.target.value }))
+                }
+              />
+            </label>
+            <label>
+              Model
+              <select
+                value={deploymentForm.modelId}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, modelId: event.target.value }))
+                }
+              >
+                {Object.keys(resources?.models ?? {}).map((modelId) => (
+                  <option key={modelId} value={modelId}>
+                    {modelId}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              API Model Alias
+              <input
+                value={deploymentForm.apiModelName}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, apiModelName: event.target.value }))
+                }
+              />
+            </label>
+            <label>
+              Display Name
+              <input
+                value={deploymentForm.displayName}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, displayName: event.target.value }))
+                }
+              />
+            </label>
+            <label>
+              Backend Runtime
+              <select
+                value={deploymentForm.backendRuntimeId}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, backendRuntimeId: event.target.value }))
+                }
+              >
+                {backendIds.map((backendId) => (
+                  <option key={backendId} value={backendId}>
+                    {backendId}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              GPU Group
+              <select
+                value={deploymentForm.gpuGroupId}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, gpuGroupId: event.target.value }))
+                }
+              >
+                {gpuGroupIds.map((gpuGroupId) => (
+                  <option key={gpuGroupId} value={gpuGroupId}>
+                    {gpuGroupId}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Memory Fraction
+              <input
+                value={deploymentForm.memoryFraction}
+                onChange={(event) =>
+                  setDeploymentForm((current) => ({ ...current, memoryFraction: event.target.value }))
+                }
+              />
+            </label>
+            <div className="check-grid">
+              {(["chat", "completion", "embedding"] as const).map((task) => (
+                <label key={task} className="check-item">
+                  <input
+                    type="checkbox"
+                    checked={deploymentForm.tasks.includes(task)}
+                    onChange={() => toggleDeploymentTask(task)}
+                  />
+                  <span>{task}</span>
+                </label>
+              ))}
+            </div>
+            <button onClick={() => submitDeploymentOnboarding().catch((error: Error) => setMessage(error.message))}>
+              Save Deployment
+            </button>
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-header">
             <h2>Config Editor</h2>
             <p>Raw editor for backends, models, deployments, GPU groups, and GPU mapping.</p>
           </div>
@@ -540,8 +729,8 @@ export default function App() {
 
         <article className="panel">
           <div className="panel-header">
-            <h2>Keys and Drains</h2>
-            <p>Issue inference keys and free a GPU group on demand.</p>
+            <h2>Keys and Runtime Control</h2>
+            <p>Issue inference keys, load or unload deployments, and drain a GPU group on demand.</p>
           </div>
           <div className="stack">
             <label>
@@ -561,6 +750,20 @@ export default function App() {
             <button className="secondary" onClick={() => drainGroup().catch((error: Error) => setMessage(error.message))}>
               Drain Group
             </button>
+            <label>
+              Load Deployment
+              <input value={loadDeploymentId} onChange={(event) => setLoadDeploymentId(event.target.value)} />
+            </label>
+            <button className="secondary" onClick={() => loadDeployment().catch((error: Error) => setMessage(error.message))}>
+              Load Deployment
+            </button>
+            <label>
+              Unload Deployment
+              <input value={unloadDeploymentId} onChange={(event) => setUnloadDeploymentId(event.target.value)} />
+            </label>
+            <button className="secondary" onClick={() => unloadDeployment().catch((error: Error) => setMessage(error.message))}>
+              Unload Deployment
+            </button>
           </div>
           <ul className="compact-list">
             {apiKeys.map((item) => (
@@ -576,7 +779,15 @@ export default function App() {
         <article className="panel panel-wide">
           <div className="panel-header">
             <h2>Queues and Runtime</h2>
-            <p>Loaded deployments, active requests, batch jobs, drains, and GPU observations.</p>
+            <p>Loaded deployments, group summaries, active requests, batch jobs, drains, and GPU observations.</p>
+          </div>
+          <pre>{JSON.stringify({ gpu_groups: runtime?.gpu_groups, backend_health: runtime?.backend_health }, null, 2)}</pre>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-header">
+            <h2>Runtime Details</h2>
+            <p>Full raw runtime snapshot for deeper debugging.</p>
           </div>
           <pre>{JSON.stringify(runtime, null, 2)}</pre>
         </article>

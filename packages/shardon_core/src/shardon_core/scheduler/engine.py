@@ -80,12 +80,18 @@ class SchedulerEngine:
             if self._group_is_draining(deployment.gpu_group_id, snapshot):
                 continue
             group = self.config.gpu_groups[deployment.gpu_group_id]
-            if not self._group_allows_admission(group, deployment, snapshot):
-                continue
             loaded_here = self._loaded_in_group(group.id, snapshot)
+            can_switch = not loaded_here or self._can_switch(group.id, request.priority, snapshot, now)
             if request.request_class == "batch" and loaded_here:
                 continue
-            if loaded_here and not self._can_switch(group.id, request.priority, snapshot, now):
+            if loaded_here and not can_switch:
+                continue
+            if not self._group_allows_admission(
+                group,
+                deployment,
+                snapshot,
+                assumed_evictions=loaded_here if can_switch else [],
+            ):
                 continue
             return SchedulingDecision(
                 True,
@@ -130,6 +136,8 @@ class SchedulerEngine:
         group: GPUGroupConfig,
         deployment: DeploymentConfig,
         snapshot: RuntimeStateSnapshot,
+        *,
+        assumed_evictions: list[str],
     ) -> bool:
         observation_totals = [snapshot.gpu_observations.get(gpu_id) for gpu_id in group.gpu_ids]
         if not observation_totals:
@@ -140,7 +148,13 @@ class SchedulerEngine:
             for state in snapshot.deployments.values()
             if state.gpu_group_id == group.id and state.loaded
         )
-        if currently_reserved + deployment.memory_fraction > memory_limit:
+        reclaimable_fraction = sum(
+            snapshot.deployments[deployment_id].resident_memory_fraction
+            for deployment_id in assumed_evictions
+            if deployment_id in snapshot.deployments
+        )
+        effective_reserved = max(0.0, currently_reserved - reclaimable_fraction)
+        if effective_reserved + deployment.memory_fraction > memory_limit:
             return False
         for observation in observation_totals:
             if observation is None:

@@ -193,3 +193,29 @@ def test_scheduler_switches_after_grace_window_expires() -> None:
     assert decision.deployment_id == "dep-b"
     assert decision.should_load is True
 
+
+def test_scheduler_allows_swap_when_eviction_reclaims_group_budget() -> None:
+    config = _config()
+    config.deployments["dep-a"].memory_fraction = 0.9
+    config.deployments["dep-b"].memory_fraction = 0.9
+    scheduler = SchedulerEngine(config)
+    snapshot = RuntimeStateSnapshot(
+        deployments={
+            "dep-a": DeploymentRuntimeState(
+                deployment_id="dep-a",
+                gpu_group_id="group-1",
+                backend_runtime_id="backend-a",
+                loaded=True,
+                resident_memory_fraction=0.9,
+                last_used_at="2026-04-21T00:00:00+00:00",
+            )
+        }
+    )
+    decision = scheduler.schedule(
+        SchedulingRequest("beta", "chat", 200, "interactive", "req-3"),
+        snapshot,
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-b"
+    assert decision.should_evict == ["dep-a"]

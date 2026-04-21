@@ -1,7 +1,1 @@
-id: gpu1
-uuid: GPU-22222222-2222-2222-2222-222222222222
-pci_bus_id: "00000000:02:00.0"
-vendor: nvidia
-observed_name: Demo GPU 1
-cuda_visible_index: 1
-
+../gpu-inventory-available/gpu1.yaml

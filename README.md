@@ -27,18 +27,21 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 
 ## Quick Start
 
-1. Install Python dependencies with `uv sync`.
-2. Install frontend dependencies with `npm install`.
-3. Optional: create a repo `.env` from [.env.example](.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
-4. Start the admin API with `uv run --package shardon-admin-api shardon-admin-api`.
-5. Start the router API with `uv run --package shardon-router-api shardon-router-api`.
-6. Start the admin web UI with `npm --workspace apps/admin_web run dev`.
+1. Bootstrap a fresh clone with `make setup` or `./scripts/bootstrap.sh`.
+2. Optional: create a repo `.env` from [.env.example](.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
+3. Start the full local stack with `make dev` or `./scripts/run-local.sh`.
 
 Default ports:
 
 - Admin API: `http://127.0.0.1:8081`
 - Router API: `http://127.0.0.1:8080`
 - Admin UI: `http://127.0.0.1:5173`
+
+Individual services are also available:
+
+- `make admin`
+- `make router`
+- `make web`
 
 ## Core Ideas
 
@@ -55,6 +58,15 @@ Default ports:
 - The token is not stored in YAML, runtime JSON, or the admin UI.
 - Backend subprocesses inherit `HF_TOKEN`, `HF_HOME`, and the model source information when launched.
 - The admin UI now includes a guided model onboarding form and shows only whether `HF_TOKEN` is configured, never the secret itself.
+
+## Runtime Operator Commands
+
+- `shardon runtime status`
+- `shardon runtime load --deployment <id>`
+- `shardon runtime load --model <api-model> --gpu-group <group>`
+- `shardon runtime unload --deployment <id>`
+
+These commands are intended for cold-start debugging, manual health validation, and GPU-fit checks outside routed inference traffic.
 
 ## Documentation
 

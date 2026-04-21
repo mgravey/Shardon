@@ -12,12 +12,14 @@ Shardon keeps desired state in YAML.
 - `config/auth/admins-available` and `config/auth/admins-enabled`
 
 The `enabled/` folders are intended to be symlink-friendly, mirroring the familiar Nginx pattern.
+Shardon now treats symlinks as the default operational model: enabled entries should point at the canonical file in the matching `available/` directory.
 
 ## Important Fields
 
 - Backends define runtime folder, launch command, capabilities, type, version, and health endpoint.
 - Models define logical identity, source, tokenizer, display metadata, and backend compatibility.
 - Deployments bind model plus backend runtime plus GPU group plus API-visible alias and memory budget.
+- One logical model can have multiple deployments across multiple GPU groups. The scheduler chooses between those deployments based on readiness, occupancy, draining state, and budget.
 - GPU inventory captures stable identity using UUID and PCI bus information instead of only transient indices.
 - GPU groups define scheduling targets, usable memory fraction, and `keep_free`.
 

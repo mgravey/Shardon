@@ -8,7 +8,9 @@ Shardon schedules both interactive and batch work against deployments rather tha
 - If a compatible deployment is already loaded, reuse is preferred.
 - If switching is needed, LRU is the default eviction strategy.
 - If lower-priority work is still queued for the currently loaded model, Shardon preserves that model for up to five minutes before switching.
-- When no admissible deployment exists, the router returns HTTP `409`.
+- When a target GPU group is occupied by another managed deployment, Shardon evaluates whether it can evict and swap that deployment cleanly.
+- Backend startup is gated by readiness checks before the request is forwarded.
+- When no admissible deployment exists, the router returns HTTP `409` with candidate and GPU-group diagnostics instead of only a generic timeout.
 
 ## Batch Jobs
 
@@ -16,4 +18,3 @@ Shardon schedules both interactive and batch work against deployments rather tha
 - Batch execution is handled by Shardon itself.
 - Batch work never forces a model switch on a busy group.
 - Extra Shardon endpoints expose progress beyond the standard batch API.
-

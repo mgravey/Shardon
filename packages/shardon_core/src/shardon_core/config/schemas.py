@@ -17,6 +17,10 @@ class GlobalConfig(BaseModel):
     scheduler_tick_seconds: int = 5
     queue_poll_interval_seconds: float = 0.25
     default_memory_fraction: float = 0.9
+    interactive_request_timeout_seconds: int = 60
+    backend_startup_timeout_seconds: int = 180
+    backend_readiness_poll_interval_seconds: float = 1.0
+    backend_stop_timeout_seconds: int = 30
 
 
 class BackendCapabilities(BaseModel):
@@ -40,6 +44,9 @@ class BackendRuntimeConfig(BaseModel):
     working_directory: str | None = None
     environment: dict[str, str] = Field(default_factory=dict)
     health_path: str = "/health"
+    startup_timeout_seconds: int | None = None
+    readiness_poll_interval_seconds: float | None = None
+    stop_timeout_seconds: int | None = None
     capabilities: BackendCapabilities = Field(default_factory=BackendCapabilities)
 
 

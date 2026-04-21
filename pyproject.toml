@@ -5,6 +5,13 @@ members = [
   "apps/router_api",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.0",
+]
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 addopts = "-q"
@@ -19,4 +26,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

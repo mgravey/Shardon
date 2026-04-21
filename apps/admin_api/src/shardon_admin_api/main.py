@@ -16,9 +16,11 @@ from shardon_core.api.schemas import (
     DrainRequest,
     EnvironmentStatusResponse,
     ModelOnboardingRequest,
+    RuntimeLoadRequest,
 )
 from shardon_core.config.schemas import BackendRuntimeConfig, DeploymentConfig, GPUDeviceConfig, GPUGroupConfig, ModelConfig
 from shardon_core.services.container import build_container
+from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.utils.env import load_dotenv_file
 
 
@@ -41,12 +43,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    def get_runtime(request: Request):
+    def get_runtime(request: Request) -> ShardonRuntime:
         return request.app.state.runtime
 
     def admin_user(
         authorization: Annotated[str | None, Header()] = None,
-        runtime=Depends(get_runtime),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> str:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="missing admin bearer token")
@@ -55,12 +57,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid admin token")
         return username
 
+    RuntimeDep = Annotated[ShardonRuntime, Depends(get_runtime)]
+    AdminIdentityDep = Annotated[str, Depends(admin_user)]
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "admin"}
 
     @app.post("/auth/login", response_model=AdminLoginResponse)
-    async def login(payload: AdminLoginRequest, runtime=Depends(get_runtime)) -> AdminLoginResponse:
+    async def login(payload: AdminLoginRequest, runtime: RuntimeDep) -> AdminLoginResponse:
         token = runtime.admin_auth.authenticate(payload.username, payload.password)
         if token is None:
             raise HTTPException(status_code=401, detail="invalid credentials")
@@ -68,9 +73,10 @@ def create_app() -> FastAPI:
 
     @app.get("/config/validate")
     async def validate_config(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
+        _ = admin_identity
         config = runtime.reload_config()
         return {
             "valid": True,
@@ -85,9 +91,10 @@ def create_app() -> FastAPI:
 
     @app.get("/resources")
     async def list_resources(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
+        _ = admin_identity
         config = runtime.config
         return {
             "backends": config.backends,
@@ -101,18 +108,20 @@ def create_app() -> FastAPI:
     async def put_backend(
         backend_id: str,
         payload: BackendRuntimeConfig,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.upsert_config_item(collection="backends", item_id=backend_id, payload=payload.model_dump(mode="json"))
         return {"status": "ok"}
 
     @app.delete("/resources/backends/{backend_id}")
     async def delete_backend(
         backend_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.delete_config_item(collection="backends", item_id=backend_id)
         return {"status": "ok"}
 
@@ -120,18 +129,20 @@ def create_app() -> FastAPI:
     async def put_model(
         model_id: str,
         payload: ModelConfig,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.upsert_config_item(collection="models", item_id=model_id, payload=payload.model_dump(mode="json"))
         return {"status": "ok"}
 
     @app.delete("/resources/models/{model_id}")
     async def delete_model(
         model_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.delete_config_item(collection="models", item_id=model_id)
         return {"status": "ok"}
 
@@ -139,9 +150,10 @@ def create_app() -> FastAPI:
     async def put_deployment(
         deployment_id: str,
         payload: DeploymentConfig,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.upsert_config_item(
             collection="deployments",
             item_id=deployment_id,
@@ -152,9 +164,10 @@ def create_app() -> FastAPI:
     @app.delete("/resources/deployments/{deployment_id}")
     async def delete_deployment(
         deployment_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.delete_config_item(collection="deployments", item_id=deployment_id)
         return {"status": "ok"}
 
@@ -162,9 +175,10 @@ def create_app() -> FastAPI:
     async def put_gpu_group(
         group_id: str,
         payload: GPUGroupConfig,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.upsert_config_item(
             collection="gpu-groups",
             item_id=group_id,
@@ -175,9 +189,10 @@ def create_app() -> FastAPI:
     @app.delete("/resources/gpu-groups/{group_id}")
     async def delete_gpu_group(
         group_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.delete_config_item(collection="gpu-groups", item_id=group_id)
         return {"status": "ok"}
 
@@ -185,9 +200,10 @@ def create_app() -> FastAPI:
     async def put_gpu_device(
         gpu_id: str,
         payload: GPUDeviceConfig,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.upsert_config_item(
             collection="gpu-inventory",
             item_id=gpu_id,
@@ -198,24 +214,26 @@ def create_app() -> FastAPI:
     @app.delete("/resources/gpu-devices/{gpu_id}")
     async def delete_gpu_device(
         gpu_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.delete_config_item(collection="gpu-inventory", item_id=gpu_id)
         return {"status": "ok"}
 
     @app.get("/api-keys")
     async def list_api_keys(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> Any:
+        _ = admin_identity
         return runtime.api_keys.list_keys()
 
     @app.post("/api-keys", response_model=APIKeySecretResponse)
     async def create_api_key(
         payload: CreateAPIKeyRequest,
-        username: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> APIKeySecretResponse:
         record, secret = runtime.api_keys.create_key(
             key_id=payload.key_id,
@@ -230,8 +248,8 @@ def create_app() -> FastAPI:
     @app.delete("/api-keys/{key_id}")
     async def revoke_api_key(
         key_id: str,
-        username: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
         record = runtime.api_keys.revoke_key(key_id, username)
         if record is None:
@@ -240,9 +258,10 @@ def create_app() -> FastAPI:
 
     @app.get("/runtime/status")
     async def runtime_status(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
+        _ = admin_identity
         runtime.refresh_gpu_observations()
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
@@ -250,42 +269,84 @@ def create_app() -> FastAPI:
 
     @app.get("/runtime/environment", response_model=EnvironmentStatusResponse)
     async def runtime_environment(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> EnvironmentStatusResponse:
+        _ = admin_identity
         return EnvironmentStatusResponse.model_validate(runtime.environment_status())
 
     @app.get("/runtime/logs/{deployment_id}")
     async def runtime_logs(
         deployment_id: str,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
+        _ = admin_identity
         return {"deployment_id": deployment_id, "lines": runtime.read_backend_log(deployment_id)}
 
     @app.get("/runtime/events")
     async def runtime_events(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
+        _ = admin_identity
         return {"lines": runtime.read_events()}
 
     @app.post("/runtime/drain/{gpu_group_id}")
     async def drain_group(
         gpu_group_id: str,
         payload: DrainRequest,
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> Any:
+        _ = admin_identity
         if gpu_group_id not in runtime.config.gpu_groups:
             raise HTTPException(status_code=404, detail="unknown gpu group")
         return await runtime.drain_group(gpu_group_id, payload.timeout_seconds)
 
+    @app.post("/runtime/load/{deployment_id}")
+    async def runtime_load_deployment(
+        deployment_id: str,
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.load_deployment(deployment_id=deployment_id, actor=username)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/load")
+    async def runtime_load_selector(
+        payload: RuntimeLoadRequest,
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.load_deployment(
+                deployment_id=payload.deployment_id,
+                model_name=payload.model_name,
+                gpu_group_id=payload.gpu_group_id,
+                actor=username,
+            )
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/unload/{deployment_id}")
+    async def runtime_unload_deployment(
+        deployment_id: str,
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.unload_deployment(deployment_id, actor=username)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
     @app.post("/workflows/model-onboarding")
     async def onboard_model(
         payload: ModelOnboardingRequest,
-        username: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        username: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, Any]:
         backend_compatibility = sorted(set(payload.backend_compatibility))
         model_payload = ModelConfig(
@@ -346,9 +407,10 @@ def create_app() -> FastAPI:
 
     @app.post("/debug/reload-config")
     async def reload_config(
-        _: Annotated[str, Depends(admin_user)],
-        runtime=Depends(get_runtime),
+        admin_identity: AdminIdentityDep,
+        runtime: RuntimeDep,
     ) -> dict[str, str]:
+        _ = admin_identity
         runtime.reload_config()
         return {"status": "ok"}
 

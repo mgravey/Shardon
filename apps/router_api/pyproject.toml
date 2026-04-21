@@ -17,6 +17,8 @@ dependencies = [
 [project.scripts]
 shardon-router-api = "shardon_router_api.main:main"
 
+[tool.uv.sources]
+shardon-core = { workspace = true }
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/shardon_router_api"]
-

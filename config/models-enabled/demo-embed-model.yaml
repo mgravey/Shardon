@@ -1,11 +1,1 @@
-id: demo-embed-model
-source: /models/demo-embed-model
-display_name: Demo Embedding Model
-backend_compatibility:
-  - sglang
-tasks:
-  - embedding
-tokenizer: demo-embed-tokenizer
-metadata:
-  family: demo
-
+../models-available/demo-embed-model.yaml
