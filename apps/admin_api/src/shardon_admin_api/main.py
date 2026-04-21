@@ -57,15 +57,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid admin token")
         return username
 
-    RuntimeDep = Annotated[ShardonRuntime, Depends(get_runtime)]
-    AdminIdentityDep = Annotated[str, Depends(admin_user)]
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "admin"}
 
     @app.post("/auth/login", response_model=AdminLoginResponse)
-    async def login(payload: AdminLoginRequest, runtime: RuntimeDep) -> AdminLoginResponse:
+    async def login(
+        payload: AdminLoginRequest,
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> AdminLoginResponse:
         token = runtime.admin_auth.authenticate(payload.username, payload.password)
         if token is None:
             raise HTTPException(status_code=401, detail="invalid credentials")
@@ -73,8 +73,8 @@ def create_app() -> FastAPI:
 
     @app.get("/config/validate")
     async def validate_config(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         _ = admin_identity
         config = runtime.reload_config()
@@ -91,8 +91,8 @@ def create_app() -> FastAPI:
 
     @app.get("/resources")
     async def list_resources(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         _ = admin_identity
         config = runtime.config
@@ -108,8 +108,8 @@ def create_app() -> FastAPI:
     async def put_backend(
         backend_id: str,
         payload: BackendRuntimeConfig,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.upsert_config_item(collection="backends", item_id=backend_id, payload=payload.model_dump(mode="json"))
@@ -118,8 +118,8 @@ def create_app() -> FastAPI:
     @app.delete("/resources/backends/{backend_id}")
     async def delete_backend(
         backend_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.delete_config_item(collection="backends", item_id=backend_id)
@@ -129,8 +129,8 @@ def create_app() -> FastAPI:
     async def put_model(
         model_id: str,
         payload: ModelConfig,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.upsert_config_item(collection="models", item_id=model_id, payload=payload.model_dump(mode="json"))
@@ -139,8 +139,8 @@ def create_app() -> FastAPI:
     @app.delete("/resources/models/{model_id}")
     async def delete_model(
         model_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.delete_config_item(collection="models", item_id=model_id)
@@ -150,8 +150,8 @@ def create_app() -> FastAPI:
     async def put_deployment(
         deployment_id: str,
         payload: DeploymentConfig,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.upsert_config_item(
@@ -164,8 +164,8 @@ def create_app() -> FastAPI:
     @app.delete("/resources/deployments/{deployment_id}")
     async def delete_deployment(
         deployment_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.delete_config_item(collection="deployments", item_id=deployment_id)
@@ -175,8 +175,8 @@ def create_app() -> FastAPI:
     async def put_gpu_group(
         group_id: str,
         payload: GPUGroupConfig,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.upsert_config_item(
@@ -189,8 +189,8 @@ def create_app() -> FastAPI:
     @app.delete("/resources/gpu-groups/{group_id}")
     async def delete_gpu_group(
         group_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.delete_config_item(collection="gpu-groups", item_id=group_id)
@@ -200,8 +200,8 @@ def create_app() -> FastAPI:
     async def put_gpu_device(
         gpu_id: str,
         payload: GPUDeviceConfig,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.upsert_config_item(
@@ -214,8 +214,8 @@ def create_app() -> FastAPI:
     @app.delete("/resources/gpu-devices/{gpu_id}")
     async def delete_gpu_device(
         gpu_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.delete_config_item(collection="gpu-inventory", item_id=gpu_id)
@@ -223,8 +223,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api-keys")
     async def list_api_keys(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         _ = admin_identity
         return runtime.api_keys.list_keys()
@@ -232,8 +232,8 @@ def create_app() -> FastAPI:
     @app.post("/api-keys", response_model=APIKeySecretResponse)
     async def create_api_key(
         payload: CreateAPIKeyRequest,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> APIKeySecretResponse:
         record, secret = runtime.api_keys.create_key(
             key_id=payload.key_id,
@@ -248,8 +248,8 @@ def create_app() -> FastAPI:
     @app.delete("/api-keys/{key_id}")
     async def revoke_api_key(
         key_id: str,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         record = runtime.api_keys.revoke_key(key_id, username)
         if record is None:
@@ -258,8 +258,8 @@ def create_app() -> FastAPI:
 
     @app.get("/runtime/status")
     async def runtime_status(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         _ = admin_identity
         runtime.refresh_gpu_observations()
@@ -269,8 +269,8 @@ def create_app() -> FastAPI:
 
     @app.get("/runtime/environment", response_model=EnvironmentStatusResponse)
     async def runtime_environment(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> EnvironmentStatusResponse:
         _ = admin_identity
         return EnvironmentStatusResponse.model_validate(runtime.environment_status())
@@ -278,16 +278,16 @@ def create_app() -> FastAPI:
     @app.get("/runtime/logs/{deployment_id}")
     async def runtime_logs(
         deployment_id: str,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         _ = admin_identity
         return {"deployment_id": deployment_id, "lines": runtime.read_backend_log(deployment_id)}
 
     @app.get("/runtime/events")
     async def runtime_events(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         _ = admin_identity
         return {"lines": runtime.read_events()}
@@ -296,8 +296,8 @@ def create_app() -> FastAPI:
     async def drain_group(
         gpu_group_id: str,
         payload: DrainRequest,
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         _ = admin_identity
         if gpu_group_id not in runtime.config.gpu_groups:
@@ -307,8 +307,8 @@ def create_app() -> FastAPI:
     @app.post("/runtime/load/{deployment_id}")
     async def runtime_load_deployment(
         deployment_id: str,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         try:
             return await runtime.load_deployment(deployment_id=deployment_id, actor=username)
@@ -318,8 +318,8 @@ def create_app() -> FastAPI:
     @app.post("/runtime/load")
     async def runtime_load_selector(
         payload: RuntimeLoadRequest,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         try:
             return await runtime.load_deployment(
@@ -334,8 +334,8 @@ def create_app() -> FastAPI:
     @app.post("/runtime/unload/{deployment_id}")
     async def runtime_unload_deployment(
         deployment_id: str,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         try:
             return await runtime.unload_deployment(deployment_id, actor=username)
@@ -345,8 +345,8 @@ def create_app() -> FastAPI:
     @app.post("/workflows/model-onboarding")
     async def onboard_model(
         payload: ModelOnboardingRequest,
-        username: AdminIdentityDep,
-        runtime: RuntimeDep,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, Any]:
         backend_compatibility = sorted(set(payload.backend_compatibility))
         model_payload = ModelConfig(
@@ -407,8 +407,8 @@ def create_app() -> FastAPI:
 
     @app.post("/debug/reload-config")
     async def reload_config(
-        admin_identity: AdminIdentityDep,
-        runtime: RuntimeDep,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> dict[str, str]:
         _ = admin_identity
         runtime.reload_config()

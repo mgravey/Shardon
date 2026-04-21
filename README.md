@@ -13,6 +13,7 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - OpenAI-compatible endpoints for `models`, `chat/completions`, `completions`, `embeddings`, and `batches`.
 - Admin UI for configuration, status, drains, keys, requests, jobs, and events.
 - Demo mock runtimes for local development without GPUs.
+- Route-level FastAPI dependencies declared directly with `= Depends(...)` for compatibility across FastAPI/Pydantic versions.
 
 ## Monorepo
 

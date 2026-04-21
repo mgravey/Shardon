@@ -58,7 +58,7 @@ def create_app() -> FastAPI:
     def api_key_auth(
         authorization: Annotated[str | None, Header()] = None,
         runtime: ShardonRuntime = Depends(get_runtime),
-    ):
+    ) -> AuthResult:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail={"error": "missing api key"})
         auth = runtime.api_keys.authenticate(authorization.removeprefix("Bearer ").strip())
@@ -66,23 +66,23 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail={"error": "invalid api key"})
         return auth
 
-    RuntimeDep = Annotated[ShardonRuntime, Depends(get_runtime)]
-    AuthDep = Annotated[AuthResult, Depends(api_key_auth)]
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "router"}
 
     @app.get("/v1/models")
-    async def list_models(auth: AuthDep, runtime: RuntimeDep) -> dict[str, Any]:
+    async def list_models(
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> dict[str, Any]:
         _ = auth
         return {"object": "list", "data": runtime.list_api_models()}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
         payload: ChatCompletionRequest,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         try:
             return await runtime.route_chat(payload, auth)
@@ -92,8 +92,8 @@ def create_app() -> FastAPI:
     @app.post("/v1/completions")
     async def completions(
         payload: CompletionRequest,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         try:
             return await runtime.route_completion(payload, auth)
@@ -103,8 +103,8 @@ def create_app() -> FastAPI:
     @app.post("/v1/embeddings")
     async def embeddings(
         payload: EmbeddingRequest,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         try:
             return await runtime.route_embedding(payload, auth)
@@ -114,8 +114,8 @@ def create_app() -> FastAPI:
     @app.post("/v1/batches")
     async def create_batch(
         payload: BatchCreateRequest,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         job = await runtime.submit_batch(payload, auth)
         return {"id": job.id, "object": "batch", "status": job.status}
@@ -123,8 +123,8 @@ def create_app() -> FastAPI:
     @app.get("/v1/batches/{batch_id}")
     async def get_batch(
         batch_id: str,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         snapshot = runtime.snapshot()
         job = snapshot.batch_jobs.get(batch_id)
@@ -136,8 +136,8 @@ def create_app() -> FastAPI:
 
     @app.get("/shardon/status")
     async def shardon_status(
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         _ = auth
         runtime.refresh_gpu_observations()
@@ -148,8 +148,8 @@ def create_app() -> FastAPI:
     @app.get("/shardon/batches/{batch_id}/progress")
     async def batch_progress(
         batch_id: str,
-        auth: AuthDep,
-        runtime: RuntimeDep,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         snapshot = runtime.snapshot()
         job = snapshot.batch_jobs.get(batch_id)
