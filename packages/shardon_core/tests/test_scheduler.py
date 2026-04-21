@@ -11,7 +11,7 @@ from shardon_core.config.schemas import (
     RepositoryConfig,
 )
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingRequest
-from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, RuntimeStateSnapshot
+from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, GPUObservation, RuntimeStateSnapshot
 
 
 def _config() -> RepositoryConfig:
@@ -213,6 +213,40 @@ def test_scheduler_allows_swap_when_eviction_reclaims_group_budget() -> None:
     )
     decision = scheduler.schedule(
         SchedulingRequest("beta", "chat", 200, "interactive", "req-3"),
+        snapshot,
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-b"
+    assert decision.should_evict == ["dep-a"]
+
+
+def test_scheduler_allows_swap_when_eviction_restores_free_memory_observation() -> None:
+    config = _config()
+    config.deployments["dep-a"].memory_fraction = 0.7
+    config.deployments["dep-b"].memory_fraction = 0.7
+    scheduler = SchedulerEngine(config)
+    snapshot = RuntimeStateSnapshot(
+        deployments={
+            "dep-a": DeploymentRuntimeState(
+                deployment_id="dep-a",
+                gpu_group_id="group-1",
+                backend_runtime_id="backend-a",
+                loaded=True,
+                resident_memory_fraction=0.7,
+                last_used_at="2026-04-21T00:00:00+00:00",
+            )
+        },
+        gpu_observations={
+            "gpu0": GPUObservation(
+                gpu_id="gpu0",
+                free_memory_mb=100,
+                total_memory_mb=1000,
+            )
+        },
+    )
+    decision = scheduler.schedule(
+        SchedulingRequest("beta", "chat", 200, "interactive", "req-4"),
         snapshot,
         datetime.now(tz=UTC),
     )

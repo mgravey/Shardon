@@ -160,7 +160,8 @@ class SchedulerEngine:
             if observation is None:
                 continue
             free_fraction = observation.free_memory_mb / max(observation.total_memory_mb, 1)
-            if free_fraction < (1 - deployment.memory_fraction) * 0.5:
+            effective_free_fraction = min(1.0, free_fraction + reclaimable_fraction)
+            if effective_free_fraction < (1 - deployment.memory_fraction) * 0.5:
                 return False
         return True
 
