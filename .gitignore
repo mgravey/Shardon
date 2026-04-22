@@ -134,6 +134,8 @@ celerybeat.pid
 /.venv-shardon/
 /.venv-work/
 state/**/*.bak*
+state/**/*.tmp
+config/router.local.yaml
 env/
 venv/
 ENV/

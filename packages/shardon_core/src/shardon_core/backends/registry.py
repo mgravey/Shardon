@@ -52,7 +52,7 @@ class BackendRegistry:
         backend = self.config.backends[deployment.backend_runtime_id]
         timeout_seconds = (
             backend.startup_timeout_seconds
-            or self.config.global_config.backend_startup_timeout_seconds
+            or self.config.global_config.effective_backend_startup_timeout_seconds()
         )
         poll_interval_seconds = (
             backend.readiness_poll_interval_seconds

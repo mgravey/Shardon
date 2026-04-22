@@ -66,6 +66,8 @@ Individual services are also available:
 - Shardon marks a backend healthy when the configured health endpoint returns a `2xx` response.
 - JSON responses are stored as health payloads as-is.
 - Non-JSON `2xx` responses (for example plain-text `/health` from some vLLM builds) are accepted and stored with status metadata instead of failing readiness.
+- On startup and periodic health refresh, loaded runtime state is reconciled with live process IDs so stale loaded flags are cleared.
+- Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
 
 ## Runtime Operator Commands
 
@@ -82,6 +84,12 @@ Queue management notes:
 - `clear-queue` clears interactive queued requests from runtime state.
 - `clear-queue --batches` also cancels queued (not running) batch jobs.
 - Admin API exposes the same operation at `POST /runtime/queue/clear`.
+
+Runtime timeout defaults:
+
+- `interactive_request_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
+- `backend_startup_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
+- `queue_poll_interval_seconds` controls how often queued interactive requests retry scheduling decisions while waiting for eviction/startup readiness.
 
 ## Documentation
 

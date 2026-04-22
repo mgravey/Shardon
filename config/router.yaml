@@ -9,7 +9,7 @@ default_drain_timeout_seconds: 120
 scheduler_tick_seconds: 5
 queue_poll_interval_seconds: 0.25
 default_memory_fraction: 0.9
-interactive_request_timeout_seconds: 60
-backend_startup_timeout_seconds: 180
+interactive_request_timeout_seconds: 600
+backend_startup_timeout_seconds: 600
 backend_readiness_poll_interval_seconds: 1.0
 backend_stop_timeout_seconds: 30

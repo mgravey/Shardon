@@ -59,6 +59,7 @@ class ShardonRuntime:
         self.scheduler = SchedulerEngine(self.config)
         self.backends = BackendRegistry(self.config, self.state_root, self.event_logger)
         self.service_user = getpass.getuser()
+        self.state_store.mutate(self._reconcile_loaded_processes)
 
     def reload_config(self) -> RepositoryConfig:
         self.config = load_repository_config(self.config_root)
@@ -237,7 +238,7 @@ class ShardonRuntime:
 
     async def refresh_backend_health(self) -> RuntimeStateSnapshot:
         results: dict[str, dict[str, Any]] = {}
-        snapshot = self.snapshot()
+        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
         loaded_backend_ids = {
             state.backend_runtime_id
             for state in snapshot.deployments.values()
@@ -266,12 +267,14 @@ class ShardonRuntime:
                     "checked_at": utc_now_iso(),
                     "error": str(exc),
                 }
-                self.event_logger.emit(
-                    "backend.health_failed",
-                    "backend health check failed",
-                    backend_runtime_id=backend_runtime_id,
-                    error=str(exc),
-                )
+                previous = snapshot.backend_health.get(backend_runtime_id, {})
+                if previous.get("status") != "unreachable" or previous.get("error") != str(exc):
+                    self.event_logger.emit(
+                        "backend.health_failed",
+                        "backend health check failed",
+                        backend_runtime_id=backend_runtime_id,
+                        error=str(exc),
+                    )
         return self.state_store.mutate(lambda snapshot: self._set_backend_health(snapshot, results))
 
     def resolve_deployment(
@@ -374,6 +377,7 @@ class ShardonRuntime:
                 },
                 status_code=409,
             )
+        self._ensure_supervised_process(deployment.id, runtime_state)
         self.backends.stop(deployment.id, force=False)
         self.state_store.mutate(
             lambda state: self._mark_unloaded(
@@ -469,7 +473,8 @@ class ShardonRuntime:
             created_at=utc_now_iso(),
         )
         self.state_store.mutate(lambda snapshot: self._enqueue_request(snapshot, queued_request))
-        deadline = asyncio.get_event_loop().time() + self.config.global_config.interactive_request_timeout_seconds
+        interactive_timeout_seconds = self.config.global_config.effective_interactive_request_timeout_seconds()
+        deadline = asyncio.get_event_loop().time() + interactive_timeout_seconds
         last_decision_reason = "no scheduling decision made yet"
         last_detail: dict[str, Any] = {}
         while asyncio.get_event_loop().time() < deadline:
@@ -529,7 +534,7 @@ class ShardonRuntime:
             "error": "request timed out waiting for a deployment",
             "model_name": model_name,
             "task": task,
-            "timeout_seconds": self.config.global_config.interactive_request_timeout_seconds,
+            "timeout_seconds": interactive_timeout_seconds,
             "last_decision_reason": last_decision_reason,
             **last_detail,
         }
@@ -597,10 +602,51 @@ class ShardonRuntime:
                     gpu_group_id=state.gpu_group_id,
                     reason=reason,
                 )
+                self._ensure_supervised_process(deployment_id, state)
                 self.backends.stop(deployment_id, force=False)
                 self.state_store.mutate(
                     lambda current: self._mark_unloaded(current, deployment_id, reason=reason)
                 )
+
+    def _ensure_supervised_process(self, deployment_id: str, runtime_state: DeploymentRuntimeState) -> None:
+        if deployment_id in self.backends.supervisor.processes:
+            return
+        if runtime_state.process_id is None:
+            return
+        backend = self.config.backends.get(runtime_state.backend_runtime_id)
+        if backend is None:
+            return
+        self.backends.supervisor.adopt(
+            deployment_id=deployment_id,
+            pid=runtime_state.process_id,
+            command=backend.launch_command,
+            log_path=self.state_root / "logs" / f"{deployment_id}.log",
+            started_at=runtime_state.loaded_at or utc_now_iso(),
+        )
+
+    def _reconcile_loaded_processes(self, snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+        snapshot = self._seed_snapshot(snapshot)
+        for deployment_id, runtime_state in snapshot.deployments.items():
+            if not runtime_state.loaded:
+                continue
+            if runtime_state.process_id is None:
+                self._mark_unloaded(
+                    snapshot,
+                    deployment_id,
+                    reason="state reconciliation: missing process_id for loaded deployment",
+                )
+                continue
+            try:
+                os.kill(runtime_state.process_id, 0)
+            except OSError:
+                self._mark_unloaded(
+                    snapshot,
+                    deployment_id,
+                    reason="state reconciliation: process not running",
+                )
+                continue
+            self._ensure_supervised_process(deployment_id, runtime_state)
+        return snapshot
 
     def _enqueue_request(self, snapshot: RuntimeStateSnapshot, request: ActiveRequest) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)

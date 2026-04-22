@@ -17,10 +17,20 @@ class GlobalConfig(BaseModel):
     scheduler_tick_seconds: int = 5
     queue_poll_interval_seconds: float = 0.25
     default_memory_fraction: float = 0.9
-    interactive_request_timeout_seconds: int = 60
-    backend_startup_timeout_seconds: int = 180
+    interactive_request_timeout_seconds: int | None = None
+    backend_startup_timeout_seconds: int | None = None
     backend_readiness_poll_interval_seconds: float = 1.0
     backend_stop_timeout_seconds: int = 30
+
+    def effective_interactive_request_timeout_seconds(self) -> int:
+        if self.interactive_request_timeout_seconds is not None:
+            return self.interactive_request_timeout_seconds
+        return 300 + self.switch_grace_window_seconds
+
+    def effective_backend_startup_timeout_seconds(self) -> int:
+        if self.backend_startup_timeout_seconds is not None:
+            return self.backend_startup_timeout_seconds
+        return 300 + self.switch_grace_window_seconds
 
 
 class BackendCapabilities(BaseModel):

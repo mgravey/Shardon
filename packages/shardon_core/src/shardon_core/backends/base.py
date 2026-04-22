@@ -68,6 +68,29 @@ class ProcessSupervisor:
         self.processes[deployment.id] = managed
         return managed
 
+    def adopt(
+        self,
+        *,
+        deployment_id: str,
+        pid: int,
+        command: list[str],
+        log_path: Path | None = None,
+        started_at: str | None = None,
+    ) -> ManagedProcess:
+        if log_path is None:
+            log_dir = self.state_root / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{deployment_id}.log"
+        managed = ManagedProcess(
+            deployment_id=deployment_id,
+            pid=pid,
+            command=command,
+            log_path=log_path,
+            started_at=started_at or utc_now_iso(),
+        )
+        self.processes[deployment_id] = managed
+        return managed
+
     def stop(self, deployment_id: str, timeout: float = 10.0) -> None:
         managed = self.processes.get(deployment_id)
         if managed is None:
