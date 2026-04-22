@@ -13,3 +13,4 @@
 - Added regression coverage for dependency binding and audio JSON/multipart routes, plus scheduler/config capability behavior.
 - Added `python-multipart` to `shardon-router-api` package dependencies so multipart audio routes start cleanly after standard bootstrap.
 - Added regression checks to ensure router multipart dependency is declared and bootstrap keeps syncing all workspace packages.
+- Interactive routing now rejects `no compatible deployment` requests immediately (HTTP 404) and does not queue unsupported/unconfigured models.

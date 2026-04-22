@@ -659,6 +659,34 @@ class ShardonRuntime:
         self.refresh_gpu_observations()
         self.enforce_keep_free()
         request_id = f"req_{uuid.uuid4().hex}"
+        preflight_snapshot = self.snapshot()
+        preflight_decision = self.scheduler.schedule(
+            SchedulingRequest(
+                model_name=model_name,
+                task=task,
+                priority=auth.priority,
+                request_class="interactive",
+                request_id=request_id,
+                required_capability=required_capability,
+            ),
+            preflight_snapshot,
+            utc_now(),
+        )
+        if not preflight_decision.accepted and preflight_decision.status_code == 404:
+            detail = {
+                "error": "no compatible deployment",
+                "model_name": model_name,
+                "task": task,
+                "required_capability": required_capability,
+                "last_decision_reason": preflight_decision.reason,
+                **self._build_candidate_status(
+                    model_name=model_name,
+                    task=task,
+                    required_capability=required_capability,
+                    snapshot=preflight_snapshot,
+                ),
+            }
+            raise RuntimeOperationError("no compatible deployment", detail=detail, status_code=404)
         queued_request = ActiveRequest(
             id=request_id,
             user_name=auth.user_name,
@@ -706,6 +734,17 @@ class ShardonRuntime:
                 required_capability=required_capability,
                 snapshot=snapshot,
             )
+            if not decision.accepted and decision.status_code == 404:
+                self.state_store.mutate(lambda state: self._drop_request(state, request_id))
+                detail = {
+                    "error": "no compatible deployment",
+                    "model_name": model_name,
+                    "task": task,
+                    "required_capability": required_capability,
+                    "last_decision_reason": decision.reason,
+                    **last_detail,
+                }
+                raise RuntimeOperationError("no compatible deployment", detail=detail, status_code=404)
             if decision.accepted and decision.deployment_id is not None:
                 if any(
                     snapshot.deployments.get(deployment_id)

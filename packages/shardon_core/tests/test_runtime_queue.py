@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 
+import pytest
+
+from shardon_core.api.schemas import ChatCompletionRequest
+from shardon_core.auth.service import AuthResult
 from shardon_core.gpu.provider import MockGPUProvider
-from shardon_core.services.runtime import ShardonRuntime
+from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.state.models import ActiveRequest, BatchJobState
 
 
@@ -105,3 +110,29 @@ def test_clear_queue_can_cancel_queued_batches(tmp_path: Path) -> None:
     assert result["batch_job_ids"] == ["batch-1"]
     assert snapshot.batch_jobs["batch-1"].status == "cancelled"
     assert snapshot.batch_jobs["batch-2"].status == "running"
+
+
+def test_unsupported_model_rejected_immediately_without_queueing(tmp_path: Path) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+    auth = AuthResult(
+        id="k1",
+        user_name="alice",
+        priority=100,
+        permissions=["inference"],
+    )
+    with pytest.raises(RuntimeOperationError) as exc:
+        asyncio.run(
+            runtime.route_chat(
+                ChatCompletionRequest(
+                    model="missing-model",
+                    messages=[{"role": "user", "content": "ping"}],
+                ),
+                auth,
+            )
+        )
+    assert exc.value.status_code == 404
+    assert exc.value.detail["error"] == "no compatible deployment"
+    assert exc.value.detail["model_name"] == "missing-model"
+    snapshot = runtime.snapshot()
+    assert snapshot.queued_requests == []
