@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 import pytest
 
-from shardon_core.backends.base import BackendAdapter
+from shardon_core.backends.base import BackendAdapter, BackendBinaryResponse, UploadedFilePayload
 from shardon_core.config.schemas import BackendRuntimeConfig
 
 
@@ -17,6 +17,25 @@ class _DummyBackendAdapter(BackendAdapter):
         return payload
 
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
+
+    async def invoke_audio_speech(self, payload: dict[str, Any]) -> BackendBinaryResponse:
+        return BackendBinaryResponse(body=b"", content_type="audio/mpeg")
+
+    async def invoke_audio_transcription(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        _ = uploaded_file
+        return payload
+
+    async def invoke_audio_translation(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        _ = uploaded_file
         return payload
 
 

@@ -137,6 +137,7 @@ state/**/*.bak*
 state/**/*.tmp
 state/**/*.pid
 state/**/*.sock
+state/audio/
 config/router.local.yaml
 env/
 venv/

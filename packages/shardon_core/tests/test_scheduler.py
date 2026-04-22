@@ -341,3 +341,42 @@ def test_scheduler_falls_back_to_next_group_when_preferred_group_is_busy() -> No
     assert decision.accepted is True
     assert decision.deployment_id == "dep-c"
     assert decision.gpu_group_id == "group-2"
+
+
+def test_scheduler_filters_candidates_by_required_modality_capability() -> None:
+    config = _config()
+    config.models["model-a"].model_capabilities = ["text"]
+    config.deployments["dep-a"].tasks = ["audio_transcription"]  # type: ignore[list-item]
+    decision = SchedulerEngine(config).schedule(
+        SchedulingRequest(
+            model_name="alpha",
+            task="audio_transcription",
+            priority=100,
+            request_class="interactive",
+            request_id="req-audio-1",
+            required_capability="audio",
+        ),
+        RuntimeStateSnapshot(),
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is False
+    assert decision.status_code == 404
+
+    config.models["model-a"].model_capabilities = ["text", "audio"]
+    config.backends["backend-a"].capabilities.modalities = ["text", "audio"]
+    config.backends["backend-a"].capabilities.audio_transcriptions = True
+    config.deployments["dep-a"].deployment_capabilities = ["audio"]
+    decision = SchedulerEngine(config).schedule(
+        SchedulingRequest(
+            model_name="alpha",
+            task="audio_transcription",
+            priority=100,
+            request_class="interactive",
+            request_id="req-audio-2",
+            required_capability="audio",
+        ),
+        RuntimeStateSnapshot(),
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-a"

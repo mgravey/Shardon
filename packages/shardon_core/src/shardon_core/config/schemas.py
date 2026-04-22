@@ -35,18 +35,40 @@ class GlobalConfig(BaseModel):
 
 
 class BackendCapabilities(BaseModel):
+    modalities: list[Literal["text", "audio", "image", "video"]] = Field(default_factory=lambda: ["text"])
     chat: bool = True
     completions: bool = True
     embeddings: bool = False
+    audio_speech: bool = False
+    audio_transcriptions: bool = False
+    audio_translations: bool = False
+    image: bool = False
+    video: bool = False
     batch: bool = True
     openai_compatible: bool = True
     max_context_length: int | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def normalize_modalities(self) -> "BackendCapabilities":
+        deduped: list[Literal["text", "audio", "image", "video"]] = []
+        for modality in self.modalities:
+            if modality not in deduped:
+                deduped.append(modality)
+        if self.audio_speech or self.audio_transcriptions or self.audio_translations:
+            if "audio" not in deduped:
+                deduped.append("audio")
+        if self.image and "image" not in deduped:
+            deduped.append("image")
+        if self.video and "video" not in deduped:
+            deduped.append("video")
+        self.modalities = deduped or ["text"]
+        return self
+
 
 class BackendRuntimeConfig(BaseModel):
     id: str
-    backend_type: Literal["vllm", "sglang", "mock"]
+    backend_type: Literal["vllm", "sglang", "mock", "whisperx"]
     version: str
     display_name: str
     runtime_dir: str
@@ -115,7 +137,16 @@ class ModelConfig(BaseModel):
     source: str
     display_name: str
     backend_compatibility: list[str]
-    tasks: list[Literal["chat", "completion", "embedding"]] = Field(default_factory=list)
+    tasks: list[
+        Literal[
+            "chat",
+            "completion",
+            "embedding",
+            "audio_speech",
+            "audio_transcription",
+            "audio_translation",
+        ]
+    ] = Field(default_factory=list)
     model_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(
         default_factory=lambda: ["text"]
     )
@@ -142,9 +173,19 @@ class DeploymentConfig(BaseModel):
     display_name: str
     memory_fraction: float = 0.9
     memory_fraction_overrides: dict[str, float] = Field(default_factory=dict)
+    deployment_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(default_factory=list)
     enabled: bool = True
     priority_weight: int = 100
-    tasks: list[Literal["chat", "completion", "embedding"]] = Field(default_factory=list)
+    tasks: list[
+        Literal[
+            "chat",
+            "completion",
+            "embedding",
+            "audio_speech",
+            "audio_transcription",
+            "audio_translation",
+        ]
+    ] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -163,6 +204,11 @@ class DeploymentConfig(BaseModel):
             raise ValueError("Deployment requires gpu_group_id or gpu_group_ids")
         self.gpu_group_ids = deduped
         self.gpu_group_id = deduped[0]
+        capability_deduped: list[Literal["text", "audio", "image", "video"]] = []
+        for capability in self.deployment_capabilities:
+            if capability not in capability_deduped:
+                capability_deduped.append(capability)
+        self.deployment_capabilities = capability_deduped
         for gpu_group_id in self.memory_fraction_overrides:
             if gpu_group_id not in self.gpu_group_ids:
                 raise ValueError(

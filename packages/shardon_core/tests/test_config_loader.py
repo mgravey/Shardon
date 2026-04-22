@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from shardon_core.config.loader import load_repository_config
+from shardon_core.config.schemas import BackendCapabilities, ModelConfig
 
 
 def _repo_root() -> Path:
@@ -27,3 +28,20 @@ def test_enabled_directories_use_symlinks() -> None:
     assert (repo_root / "config" / "backends-enabled" / "mock-vllm-v1.yaml").exists()
     assert (repo_root / "config" / "models-enabled" / "demo-chat-model.yaml").exists()
     assert (repo_root / "config" / "deployments-enabled" / "chat-a.yaml").exists()
+
+
+def test_backend_capabilities_infer_modalities_from_operation_flags() -> None:
+    capabilities = BackendCapabilities(modalities=["text"], audio_transcriptions=True, image=True)
+    assert capabilities.modalities == ["text", "audio", "image"]
+
+
+def test_model_config_accepts_audio_tasks() -> None:
+    model = ModelConfig(
+        id="audio-model",
+        source="openai/whisper-1",
+        display_name="Audio model",
+        backend_compatibility=["backend-a"],
+        tasks=["audio_transcription", "audio_translation"],
+        model_capabilities=["audio"],
+    )
+    assert model.tasks == ["audio_transcription", "audio_translation"]

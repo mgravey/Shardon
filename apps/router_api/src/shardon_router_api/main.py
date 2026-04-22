@@ -5,13 +5,21 @@ import contextlib
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 
-from shardon_core.api.schemas import BatchCreateRequest, ChatCompletionRequest, CompletionRequest, EmbeddingRequest
+from shardon_core.api.schemas import (
+    AudioMultipartRequest,
+    AudioSpeechRequest,
+    BatchCreateRequest,
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+)
 from shardon_core.auth.service import AuthResult
+from shardon_core.backends.base import UploadedFilePayload
 from shardon_core.services.container import build_container
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.utils.env import load_dotenv_file
@@ -66,6 +74,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail={"error": "invalid api key"})
         return auth
 
+    def _audio_text_response_if_requested(
+        payload: AudioMultipartRequest,
+        result: dict[str, Any],
+    ) -> Any:
+        if payload.response_format not in {"text", "srt", "vtt"}:
+            return result
+        text = result.get("text")
+        if not isinstance(text, str):
+            return result
+        media_type = "text/vtt" if payload.response_format == "vtt" else "text/plain"
+        return Response(content=text, media_type=media_type)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "router"}
@@ -108,6 +128,81 @@ def create_app() -> FastAPI:
     ) -> Any:
         try:
             return await runtime.route_embedding(payload, auth)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/v1/audio/speech")
+    async def audio_speech(
+        payload: AudioSpeechRequest,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> Response:
+        try:
+            result = await runtime.route_audio_speech(payload, auth)
+            return Response(
+                content=result.body,
+                media_type=result.content_type or "audio/mpeg",
+            )
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(
+        file: UploadFile = File(...),
+        model: str = Form(...),
+        language: str | None = Form(None),
+        prompt: str | None = Form(None),
+        response_format: Literal["json", "text", "srt", "verbose_json", "vtt"] | None = Form(None),
+        temperature: float | None = Form(None),
+        timestamp_granularities: list[Literal["word", "segment"]] | None = Form(None),
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> Any:
+        payload = AudioMultipartRequest(
+            model=model,
+            language=language,
+            prompt=prompt,
+            response_format=response_format,
+            temperature=temperature,
+            timestamp_granularities=timestamp_granularities or [],
+        )
+        uploaded_file = UploadedFilePayload(
+            filename=file.filename or "audio",
+            content=await file.read(),
+            content_type=file.content_type,
+        )
+        try:
+            result = await runtime.route_audio_transcription(payload, uploaded_file, auth)
+            return _audio_text_response_if_requested(payload, result)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/v1/audio/translations")
+    async def audio_translations(
+        file: UploadFile = File(...),
+        model: str = Form(...),
+        prompt: str | None = Form(None),
+        response_format: Literal["json", "text", "srt", "verbose_json", "vtt"] | None = Form(None),
+        temperature: float | None = Form(None),
+        timestamp_granularities: list[Literal["word", "segment"]] | None = Form(None),
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> Any:
+        payload = AudioMultipartRequest(
+            model=model,
+            prompt=prompt,
+            response_format=response_format,
+            temperature=temperature,
+            timestamp_granularities=timestamp_granularities or [],
+        )
+        uploaded_file = UploadedFilePayload(
+            filename=file.filename or "audio",
+            content=await file.read(),
+            content_type=file.content_type,
+        )
+        try:
+            result = await runtime.route_audio_translation(payload, uploaded_file, auth)
+            return _audio_text_response_if_requested(payload, result)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

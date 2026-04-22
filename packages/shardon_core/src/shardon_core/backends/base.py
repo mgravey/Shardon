@@ -30,6 +30,20 @@ class ManagedProcess:
     started_at: str
 
 
+@dataclass(slots=True)
+class UploadedFilePayload:
+    filename: str
+    content: bytes
+    content_type: str | None = None
+
+
+@dataclass(slots=True)
+class BackendBinaryResponse:
+    body: bytes
+    content_type: str | None = None
+    headers: dict[str, str] | None = None
+
+
 class ProcessSupervisor:
     def __init__(self, state_root: Path) -> None:
         self.state_root = state_root
@@ -169,19 +183,174 @@ class BackendAdapter(ABC):
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    @abstractmethod
+    async def invoke_audio_speech(self, payload: dict[str, Any]) -> BackendBinaryResponse:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def invoke_audio_transcription(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def invoke_audio_translation(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def invoke_multimodal_operation(
+        self,
+        operation: str,
+        *,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload | None = None,
+    ) -> dict[str, Any] | BackendBinaryResponse:
+        raise BackendOperationError(
+            "backend does not implement multimodal operation",
+            detail={"error": "unsupported multimodal operation", "operation": operation},
+        )
+
 
 class OpenAIHTTPBackendAdapter(BackendAdapter):
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _clean_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in payload.items() if value is not None}
+
+    async def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(f"{self.backend.base_url}{path}", json=payload)
+            response = await client.post(
+                f"{self.backend.base_url}{path}",
+                json=self._clean_payload(payload),
+            )
             response.raise_for_status()
             return response.json()
 
+    async def _post_json_binary(self, path: str, payload: dict[str, Any]) -> BackendBinaryResponse:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{self.backend.base_url}{path}",
+                json=self._clean_payload(payload),
+            )
+            response.raise_for_status()
+            return BackendBinaryResponse(
+                body=response.content,
+                content_type=response.headers.get("content-type"),
+                headers=dict(response.headers),
+            )
+
+    def _multipart_data(self, payload: dict[str, Any]) -> list[tuple[str, str]]:
+        data: list[tuple[str, str]] = []
+        for key, value in self._clean_payload(payload).items():
+            if isinstance(value, list):
+                for item in value:
+                    data.append((key, str(item)))
+            else:
+                data.append((key, str(value)))
+        return data
+
+    async def _post_multipart(
+        self,
+        path: str,
+        *,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        files = {
+            "file": (
+                uploaded_file.filename,
+                uploaded_file.content,
+                uploaded_file.content_type or "application/octet-stream",
+            )
+        }
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                f"{self.backend.base_url}{path}",
+                data=self._multipart_data(payload),
+                files=files,
+            )
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return response.json()
+            return {"text": response.text}
+
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/v1/chat/completions", payload)
+        return await self._post_json("/v1/chat/completions", payload)
 
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/v1/completions", payload)
+        return await self._post_json("/v1/completions", payload)
 
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post("/v1/embeddings", payload)
+        return await self._post_json("/v1/embeddings", payload)
+
+    async def invoke_audio_speech(self, payload: dict[str, Any]) -> BackendBinaryResponse:
+        return await self._post_json_binary("/v1/audio/speech", payload)
+
+    async def invoke_audio_transcription(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        return await self._post_multipart(
+            "/v1/audio/transcriptions",
+            payload=payload,
+            uploaded_file=uploaded_file,
+        )
+
+    async def invoke_audio_translation(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        return await self._post_multipart(
+            "/v1/audio/translations",
+            payload=payload,
+            uploaded_file=uploaded_file,
+        )
+
+
+class WhisperXBackendAdapter(OpenAIHTTPBackendAdapter):
+    def _path(self, key: str, default: str) -> str:
+        return str(self.backend.capabilities.extra.get(key, default))
+
+    def _normalize_whisperx_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "text" in payload:
+            return payload
+        segments = payload.get("segments")
+        if isinstance(segments, list):
+            text_segments = [
+                str(item.get("text", "")).strip()
+                for item in segments
+                if isinstance(item, dict) and item.get("text")
+            ]
+            if text_segments:
+                payload["text"] = " ".join(text_segments).strip()
+        return payload
+
+    async def invoke_audio_transcription(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        data = await self._post_multipart(
+            self._path("whisperx_transcriptions_path", "/asr"),
+            payload=payload,
+            uploaded_file=uploaded_file,
+        )
+        return self._normalize_whisperx_response(data)
+
+    async def invoke_audio_translation(
+        self,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload,
+    ) -> dict[str, Any]:
+        data = await self._post_multipart(
+            self._path("whisperx_translations_path", "/translate"),
+            payload=payload,
+            uploaded_file=uploaded_file,
+        )
+        return self._normalize_whisperx_response(data)

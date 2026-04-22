@@ -5,7 +5,13 @@ from typing import Any
 
 from pathlib import Path
 
-from shardon_core.backends.base import BackendOperationError, OpenAIHTTPBackendAdapter, ProcessSupervisor
+from shardon_core.backends.base import (
+    BackendAdapter,
+    BackendOperationError,
+    OpenAIHTTPBackendAdapter,
+    ProcessSupervisor,
+    WhisperXBackendAdapter,
+)
 from shardon_core.config.schemas import BackendRuntimeConfig, DeploymentConfig, RepositoryConfig
 from shardon_core.logging.events import EventLogger
 from shardon_core.utils.time import utc_now_iso
@@ -26,8 +32,10 @@ class BackendRegistry:
         backend_runtime_id: str,
         *,
         gpu_group_id: str | None = None,
-    ) -> OpenAIHTTPBackendAdapter:
+    ) -> BackendAdapter:
         backend = self.resolve_backend(backend_runtime_id, gpu_group_id=gpu_group_id)
+        if backend.backend_type == "whisperx":
+            return WhisperXBackendAdapter(backend)
         return OpenAIHTTPBackendAdapter(backend)
 
     def ensure_started(self, deployment: DeploymentConfig, *, gpu_group_id: str) -> int:

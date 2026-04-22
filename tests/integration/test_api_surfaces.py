@@ -7,6 +7,7 @@ from fastapi.params import Depends as DependsParam
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from shardon_core.backends.base import BackendBinaryResponse
 from shardon_core.auth.service import APIKeyService
 from shardon_core.logging.events import EventLogger
 
@@ -202,3 +203,94 @@ def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> Non
     _assert_dep_param(_route(router_app, "/v1/models", "GET"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "auth")
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "runtime")
+    _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "auth")
+    _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "runtime")
+    _assert_dep_param(_route(router_app, "/v1/audio/transcriptions", "POST"), "auth")
+    _assert_dep_param(_route(router_app, "/v1/audio/transcriptions", "POST"), "runtime")
+    _assert_dep_param(_route(router_app, "/v1/audio/translations", "POST"), "auth")
+    _assert_dep_param(_route(router_app, "/v1/audio/translations", "POST"), "runtime")
+
+
+def test_router_audio_routes_support_json_and_multipart(tmp_path: Path, monkeypatch) -> None:
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id="audio-key",
+        user_name="audio-user",
+        priority=100,
+        permissions=["inference"],
+        actor="admin",
+    )
+    app = create_router_app()
+    runtime = app.state.runtime
+    client = TestClient(app)
+
+    async def fake_speech(payload, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "audio-demo"
+        assert payload.input == "say hi"
+        return BackendBinaryResponse(body=b"audio-bytes", content_type="audio/mpeg")
+
+    async def fake_transcription(payload, uploaded_file, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "audio-demo"
+        assert uploaded_file.filename == "sample.wav"
+        return {"text": "transcribed"}
+
+    async def fake_translation(payload, uploaded_file, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "audio-demo"
+        assert uploaded_file.filename == "sample.wav"
+        return {"text": "translated"}
+
+    runtime.route_audio_speech = fake_speech  # type: ignore[method-assign]
+    runtime.route_audio_transcription = fake_transcription  # type: ignore[method-assign]
+    runtime.route_audio_translation = fake_translation  # type: ignore[method-assign]
+
+    unauthorized = client.post(
+        "/v1/audio/speech",
+        json={"model": "audio-demo", "input": "say hi", "voice": "alloy"},
+    )
+    _assert_no_missing_query_dependencies(unauthorized, {"auth", "runtime"})
+    assert unauthorized.status_code == 401
+
+    speech = client.post(
+        "/v1/audio/speech",
+        headers={"Authorization": f"Bearer {secret}"},
+        json={"model": "audio-demo", "input": "say hi", "voice": "alloy"},
+    )
+    assert speech.status_code == 200
+    assert speech.content == b"audio-bytes"
+    assert speech.headers["content-type"].startswith("audio/mpeg")
+
+    transcription = client.post(
+        "/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {secret}"},
+        data={"model": "audio-demo"},
+        files={"file": ("sample.wav", b"abc", "audio/wav")},
+    )
+    assert transcription.status_code == 200
+    assert transcription.json()["text"] == "transcribed"
+
+    translation = client.post(
+        "/v1/audio/translations",
+        headers={"Authorization": f"Bearer {secret}"},
+        data={"model": "audio-demo"},
+        files={"file": ("sample.wav", b"abc", "audio/wav")},
+    )
+    assert translation.status_code == 200
+    assert translation.json()["text"] == "translated"
+
+    transcription_text = client.post(
+        "/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {secret}"},
+        data={"model": "audio-demo", "response_format": "text"},
+        files={"file": ("sample.wav", b"abc", "audio/wav")},
+    )
+    assert transcription_text.status_code == 200
+    assert transcription_text.text == "transcribed"
+    assert transcription_text.headers["content-type"].startswith("text/plain")

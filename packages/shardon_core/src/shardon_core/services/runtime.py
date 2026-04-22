@@ -6,11 +6,22 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from shardon_core.api.schemas import BatchCreateRequest, ChatCompletionRequest, CompletionRequest, EmbeddingRequest
+from shardon_core.api.schemas import (
+    AudioMultipartRequest,
+    AudioSpeechRequest,
+    BatchCreateRequest,
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+)
 from shardon_core.auth.service import APIKeyService, AdminAuthService, AuthResult
-from shardon_core.backends.base import BackendOperationError
+from shardon_core.backends.base import (
+    BackendBinaryResponse,
+    BackendOperationError,
+    UploadedFilePayload,
+)
 from shardon_core.backends.registry import BackendRegistry
 from shardon_core.config.loader import load_repository_config
 from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig
@@ -236,6 +247,7 @@ class ShardonRuntime:
             if not deployment.enabled:
                 continue
             model = self.config.models[deployment.model_id]
+            backend = self.config.backends.get(deployment.backend_runtime_id)
             runtime = snapshot.deployments.get(deployment.id)
             models.setdefault(
                 deployment.api_model_name,
@@ -251,6 +263,9 @@ class ShardonRuntime:
                     "selected_gpu_group_id": runtime.selected_gpu_group_id if runtime is not None else None,
                     "tasks": deployment.tasks,
                     "model_capabilities": model.model_capabilities,
+                    "deployment_capabilities": deployment.deployment_capabilities,
+                    "backend_modalities": backend.capabilities.modalities if backend is not None else [],
+                    "effective_capabilities": self._deployment_effective_capabilities(deployment),
                 },
             )
         return list(models.values())
@@ -533,7 +548,13 @@ class ShardonRuntime:
         request: ChatCompletionRequest,
         auth: AuthResult,
     ) -> dict[str, Any]:
-        return await self._route_interactive("chat", request.model, request.model_dump(mode="json"), auth)
+        return await self._route_interactive(
+            "chat",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="text",
+        )
 
     async def route_completion(
         self,
@@ -545,6 +566,7 @@ class ShardonRuntime:
             request.model,
             request.model_dump(mode="json"),
             auth,
+            required_capability="text",
         )
 
     async def route_embedding(
@@ -552,7 +574,77 @@ class ShardonRuntime:
         request: EmbeddingRequest,
         auth: AuthResult,
     ) -> dict[str, Any]:
-        return await self._route_interactive("embedding", request.model, request.model_dump(mode="json"), auth)
+        return await self._route_interactive(
+            "embedding",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="text",
+        )
+
+    async def route_audio_speech(
+        self,
+        request: AudioSpeechRequest,
+        auth: AuthResult,
+    ) -> BackendBinaryResponse:
+        response = await self._route_interactive(
+            "audio_speech",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="audio",
+        )
+        if not isinstance(response, BackendBinaryResponse):
+            raise RuntimeOperationError(
+                "backend returned non-binary response for audio speech",
+                detail={"error": "invalid audio speech response"},
+                status_code=409,
+            )
+        return response
+
+    async def route_audio_transcription(
+        self,
+        request: AudioMultipartRequest,
+        uploaded_file: UploadedFilePayload,
+        auth: AuthResult,
+    ) -> dict[str, Any]:
+        response = await self._route_interactive(
+            "audio_transcription",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="audio",
+            uploaded_file=uploaded_file,
+        )
+        if not isinstance(response, dict):
+            raise RuntimeOperationError(
+                "backend returned non-json response for transcription",
+                detail={"error": "invalid transcription response"},
+                status_code=409,
+            )
+        return response
+
+    async def route_audio_translation(
+        self,
+        request: AudioMultipartRequest,
+        uploaded_file: UploadedFilePayload,
+        auth: AuthResult,
+    ) -> dict[str, Any]:
+        response = await self._route_interactive(
+            "audio_translation",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="audio",
+            uploaded_file=uploaded_file,
+        )
+        if not isinstance(response, dict):
+            raise RuntimeOperationError(
+                "backend returned non-json response for translation",
+                detail={"error": "invalid translation response"},
+                status_code=409,
+            )
+        return response
 
     async def _route_interactive(
         self,
@@ -560,7 +652,10 @@ class ShardonRuntime:
         model_name: str,
         payload: dict[str, Any],
         auth: AuthResult,
-    ) -> dict[str, Any]:
+        *,
+        required_capability: Literal["text", "audio", "image", "video"],
+        uploaded_file: UploadedFilePayload | None = None,
+    ) -> Any:
         self.refresh_gpu_observations()
         self.enforce_keep_free()
         request_id = f"req_{uuid.uuid4().hex}"
@@ -599,12 +694,18 @@ class ShardonRuntime:
                     priority=auth.priority,
                     request_class="interactive",
                     request_id=request_id,
+                    required_capability=required_capability,
                 ),
                 snapshot,
                 utc_now(),
             )
             last_decision_reason = decision.reason
-            last_detail = self._build_candidate_status(model_name=model_name, task=task, snapshot=snapshot)
+            last_detail = self._build_candidate_status(
+                model_name=model_name,
+                task=task,
+                required_capability=required_capability,
+                snapshot=snapshot,
+            )
             if decision.accepted and decision.deployment_id is not None:
                 if any(
                     snapshot.deployments.get(deployment_id)
@@ -623,6 +724,7 @@ class ShardonRuntime:
                         auth=auth,
                         target_gpu_group_id=decision.gpu_group_id or deployment.preferred_gpu_group_id(),
                         should_evict=decision.should_evict or [],
+                        uploaded_file=uploaded_file,
                     )
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
                     return response
@@ -662,7 +764,8 @@ class ShardonRuntime:
         auth: AuthResult,
         target_gpu_group_id: str,
         should_evict: list[str],
-    ) -> dict[str, Any]:
+        uploaded_file: UploadedFilePayload | None,
+    ) -> Any:
         snapshot = self.snapshot()
         current = snapshot.deployments.get(deployment.id)
         current_gpu_group_id = (
@@ -717,10 +820,36 @@ class ShardonRuntime:
                 result = await adapter.invoke_chat(payload)
             elif task == "completion":
                 result = await adapter.invoke_completion(payload)
-            else:
+            elif task == "embedding":
                 result = await adapter.invoke_embeddings(payload)
+            elif task == "audio_speech":
+                result = await adapter.invoke_audio_speech(payload)
+            elif task == "audio_transcription":
+                if uploaded_file is None:
+                    raise RuntimeOperationError(
+                        "missing audio file for transcription",
+                        detail={"error": "missing audio file for transcription"},
+                        status_code=422,
+                    )
+                result = await adapter.invoke_audio_transcription(payload, uploaded_file)
+            elif task == "audio_translation":
+                if uploaded_file is None:
+                    raise RuntimeOperationError(
+                        "missing audio file for translation",
+                        detail={"error": "missing audio file for translation"},
+                        status_code=422,
+                    )
+                result = await adapter.invoke_audio_translation(payload, uploaded_file)
+            else:
+                result = await adapter.invoke_multimodal_operation(
+                    task,
+                    payload=payload,
+                    uploaded_file=uploaded_file,
+                )
             self.state_store.mutate(lambda state: self._mark_request_finished(state, request_id, deployment.id))
             return result
+        except RuntimeOperationError:
+            raise
         except Exception as exc:
             self.state_store.mutate(
                 lambda state: self._mark_request_failed(state, request_id, deployment.id, str(exc))
@@ -1086,6 +1215,7 @@ class ShardonRuntime:
                 priority=100,
                 request_class="batch",
                 request_id=job.id,
+                required_capability="text",
             ),
             snapshot,
             utc_now(),
@@ -1250,6 +1380,7 @@ class ShardonRuntime:
         *,
         model_name: str,
         task: str,
+        required_capability: Literal["text", "audio", "image", "video"] | None = None,
         snapshot: RuntimeStateSnapshot,
     ) -> dict[str, Any]:
         candidates = [
@@ -1258,10 +1389,16 @@ class ShardonRuntime:
             if deployment.enabled
             and deployment.api_model_name == model_name
             and task in deployment.tasks
+            and (
+                required_capability is None
+                or required_capability in self._deployment_effective_capabilities(deployment)
+            )
         ]
         candidate_details: list[dict[str, Any]] = []
         for deployment in candidates:
             runtime = snapshot.deployments.get(deployment.id)
+            model = self.config.models.get(deployment.model_id)
+            backend = self.config.backends.get(deployment.backend_runtime_id)
             selected_gpu_group_id = (
                 (runtime.selected_gpu_group_id or runtime.gpu_group_id)
                 if runtime is not None
@@ -1274,6 +1411,14 @@ class ShardonRuntime:
                     "gpu_group_ids": deployment.eligible_gpu_group_ids(),
                     "selected_gpu_group_id": selected_gpu_group_id,
                     "backend_runtime_id": deployment.backend_runtime_id,
+                    "model_capabilities": model.model_capabilities if model is not None else [],
+                    "deployment_capabilities": deployment.deployment_capabilities,
+                    "backend_modalities": (
+                        backend.capabilities.modalities
+                        if backend is not None
+                        else []
+                    ),
+                    "effective_capabilities": self._deployment_effective_capabilities(deployment),
                     "loaded": runtime.loaded if runtime is not None else False,
                     "state": runtime.state if runtime is not None else "unloaded",
                     "active_request_ids": runtime.active_request_ids if runtime is not None else [],
@@ -1287,6 +1432,19 @@ class ShardonRuntime:
                 }
             )
         return {"candidate_deployments": candidate_details}
+
+    def _deployment_effective_capabilities(
+        self,
+        deployment: DeploymentConfig,
+    ) -> list[Literal["text", "audio", "image", "video"]]:
+        model = self.config.models.get(deployment.model_id)
+        backend = self.config.backends.get(deployment.backend_runtime_id)
+        model_capabilities = set(model.model_capabilities if model is not None else [])
+        backend_modalities = set(backend.capabilities.modalities if backend is not None else [])
+        effective = model_capabilities & backend_modalities
+        if deployment.deployment_capabilities:
+            effective &= set(deployment.deployment_capabilities)
+        return sorted(effective)
 
     def _gpu_group_summary(
         self,
@@ -1322,6 +1480,19 @@ class ShardonRuntime:
             for group_id in self.config.gpu_groups
         }
 
+    def _deployment_capability_status(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for deployment in self.config.deployments.values():
+            model = self.config.models.get(deployment.model_id)
+            backend = self.config.backends.get(deployment.backend_runtime_id)
+            data[deployment.id] = {
+                "model_capabilities": model.model_capabilities if model is not None else [],
+                "deployment_capabilities": deployment.deployment_capabilities,
+                "backend_modalities": backend.capabilities.modalities if backend is not None else [],
+                "effective_capabilities": self._deployment_effective_capabilities(deployment),
+            }
+        return data
+
     def status(self) -> dict[str, Any]:
         snapshot = self.snapshot()
         return {
@@ -1334,4 +1505,5 @@ class ShardonRuntime:
             "gpu_observations": snapshot.gpu_observations,
             "gpu_groups": self._group_runtime_status(snapshot),
             "backend_health": snapshot.backend_health,
+            "deployment_capabilities": self._deployment_capability_status(),
         }

@@ -63,6 +63,24 @@ class EmbeddingRequest(BaseModel):
     input: str | list[str]
 
 
+class AudioSpeechRequest(BaseModel):
+    model: str
+    input: str
+    voice: str
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] | None = None
+    speed: float | None = None
+    instructions: str | None = None
+
+
+class AudioMultipartRequest(BaseModel):
+    model: str
+    language: str | None = None
+    prompt: str | None = None
+    response_format: Literal["json", "text", "srt", "verbose_json", "vtt"] | None = None
+    temperature: float | None = None
+    timestamp_granularities: list[Literal["word", "segment"]] = Field(default_factory=list)
+
+
 class BatchCreateRequest(BaseModel):
     model: str
     requests: list[dict[str, Any]]
@@ -74,7 +92,16 @@ class ModelOnboardingRequest(BaseModel):
     source: str
     display_name: str
     backend_compatibility: list[str]
-    tasks: list[Literal["chat", "completion", "embedding"]] = Field(default_factory=list)
+    tasks: list[
+        Literal[
+            "chat",
+            "completion",
+            "embedding",
+            "audio_speech",
+            "audio_transcription",
+            "audio_translation",
+        ]
+    ] = Field(default_factory=list)
     model_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(
         default_factory=lambda: ["text"]
     )

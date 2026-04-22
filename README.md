@@ -11,8 +11,8 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - Scheduler with memory-aware deployment admission, LRU eviction, drain handling, keep-free enforcement, and a model-switch grace window.
 - Backend abstraction for vLLM, SGLang, and independently runnable runtime folders.
 - Deployments can declare an ordered list of eligible GPU groups, with runtime GPU-group selection at load/start time.
-- Models can declare modality capabilities (for example `text`, `audio`) surfaced in `/v1/models`.
-- OpenAI-compatible endpoints for `models`, `chat/completions`, `completions`, `embeddings`, and `batches`.
+- Models, deployments, and backends can declare modality capabilities (`text`, `audio`, `image`, `video`) surfaced in `/v1/models` and runtime status.
+- OpenAI-compatible endpoints for `models`, `chat/completions`, `completions`, `embeddings`, `audio/speech`, `audio/transcriptions`, `audio/translations`, and `batches`.
 - Admin UI for configuration, status, drains, keys, requests, jobs, and events.
 - Demo mock runtimes for local development without GPUs.
 - Route-level FastAPI dependencies declared directly with `= Depends(...)` for compatibility across FastAPI/Pydantic versions.
@@ -72,6 +72,15 @@ Individual services are also available:
 - Non-JSON `2xx` responses (for example plain-text `/health` from some vLLM builds) are accepted and stored with status metadata instead of failing readiness.
 - On startup and periodic health refresh, loaded runtime state is reconciled with live process IDs so stale loaded flags are cleared.
 - Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
+
+## Multimodal Routing
+
+- Router supports OpenAI-style audio endpoints:
+  - `POST /v1/audio/speech`
+  - `POST /v1/audio/transcriptions`
+  - `POST /v1/audio/translations`
+- Transcription/translation accept multipart uploads and preserve text-style response formats (`text`, `srt`, `vtt`) at the API boundary.
+- Backend adapters are modality-aware and include extension points for non-OpenAI-native backends (for example WhisperX) and future video operations without changing scheduler/runtime contracts.
 
 ## Runtime Operator Commands
 

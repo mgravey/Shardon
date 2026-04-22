@@ -30,7 +30,9 @@ type ModelOnboardingForm = {
   source: string;
   displayName: string;
   tokenizer: string;
-  tasks: Array<"chat" | "completion" | "embedding">;
+  tasks: Array<
+    "chat" | "completion" | "embedding" | "audio_speech" | "audio_transcription" | "audio_translation"
+  >;
   modelCapabilities: Array<"text" | "audio" | "image" | "video">;
   backendCompatibility: string[];
   createDeployment: boolean;
@@ -50,7 +52,9 @@ type DeploymentOnboardingForm = {
   apiModelName: string;
   displayName: string;
   memoryFraction: string;
-  tasks: Array<"chat" | "completion" | "embedding">;
+  tasks: Array<
+    "chat" | "completion" | "embedding" | "audio_speech" | "audio_transcription" | "audio_translation"
+  >;
 };
 
 const collections = [
@@ -274,7 +278,9 @@ export default function App() {
     await refresh();
   }
 
-  function toggleTask(task: "chat" | "completion" | "embedding") {
+  function toggleTask(
+    task: "chat" | "completion" | "embedding" | "audio_speech" | "audio_transcription" | "audio_translation",
+  ) {
     setModelForm((current) => ({
       ...current,
       tasks: current.tasks.includes(task)
@@ -327,7 +333,9 @@ export default function App() {
     await refresh();
   }
 
-  function toggleDeploymentTask(task: "chat" | "completion" | "embedding") {
+  function toggleDeploymentTask(
+    task: "chat" | "completion" | "embedding" | "audio_speech" | "audio_transcription" | "audio_translation",
+  ) {
     setDeploymentForm((current) => ({
       ...current,
       tasks: current.tasks.includes(task)
@@ -489,7 +497,9 @@ export default function App() {
               />
             </label>
             <div className="check-grid">
-              {(["chat", "completion", "embedding"] as const).map((task) => (
+              {(
+                ["chat", "completion", "embedding", "audio_speech", "audio_transcription", "audio_translation"] as const
+              ).map((task) => (
                 <label key={task} className="check-item">
                   <input
                     type="checkbox"
@@ -700,7 +710,9 @@ export default function App() {
               />
             </label>
             <div className="check-grid">
-              {(["chat", "completion", "embedding"] as const).map((task) => (
+              {(
+                ["chat", "completion", "embedding", "audio_speech", "audio_transcription", "audio_translation"] as const
+              ).map((task) => (
                 <label key={task} className="check-item">
                   <input
                     type="checkbox"

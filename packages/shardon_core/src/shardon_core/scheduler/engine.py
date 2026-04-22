@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from shardon_core.config.schemas import DeploymentConfig, GPUGroupConfig, RepositoryConfig
 from shardon_core.state.models import ActiveRequest, RuntimeStateSnapshot
@@ -28,6 +29,7 @@ class SchedulingRequest:
     request_id: str
     deployment_id: str | None = None
     target_gpu_group_id: str | None = None
+    required_capability: Literal["text", "audio", "image", "video"] | None = None
 
 
 class SchedulerEngine:
@@ -164,8 +166,39 @@ class SchedulerEngine:
             for deployment in self.config.deployments.values()
             if deployment.enabled
             and deployment.api_model_name == request.model_name
-            and request.task in deployment.tasks
+            and self._deployment_supports_request(deployment, request)
         ]
+
+    def _deployment_supports_request(
+        self,
+        deployment: DeploymentConfig,
+        request: SchedulingRequest,
+    ) -> bool:
+        if request.task not in deployment.tasks:
+            return False
+        model = self.config.models.get(deployment.model_id)
+        backend = self.config.backends.get(deployment.backend_runtime_id)
+        if model is None or backend is None:
+            return False
+        if request.required_capability is not None:
+            if request.required_capability not in model.model_capabilities:
+                return False
+            if (
+                deployment.deployment_capabilities
+                and request.required_capability not in deployment.deployment_capabilities
+            ):
+                return False
+            if request.required_capability not in backend.capabilities.modalities:
+                return False
+        capability_map = {
+            "chat": backend.capabilities.chat,
+            "completion": backend.capabilities.completions,
+            "embedding": backend.capabilities.embeddings,
+            "audio_speech": backend.capabilities.audio_speech,
+            "audio_transcription": backend.capabilities.audio_transcriptions,
+            "audio_translation": backend.capabilities.audio_translations,
+        }
+        return capability_map.get(request.task, True)
 
     def _pick_best_loaded(
         self,

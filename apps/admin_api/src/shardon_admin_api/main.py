@@ -417,6 +417,7 @@ def create_app() -> FastAPI:
                 api_model_name=payload.api_model_name,
                 display_name=payload.deployment_display_name,
                 memory_fraction=payload.memory_fraction,
+                deployment_capabilities=payload.model_capabilities,
                 enabled=payload.enabled,
                 priority_weight=payload.priority_weight,
                 tasks=payload.tasks,
