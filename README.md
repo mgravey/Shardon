@@ -10,6 +10,8 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - File-backed desired state in YAML and runtime state in JSON/JSONL.
 - Scheduler with memory-aware deployment admission, LRU eviction, drain handling, keep-free enforcement, and a model-switch grace window.
 - Backend abstraction for vLLM, SGLang, and independently runnable runtime folders.
+- Deployments can declare an ordered list of eligible GPU groups, with runtime GPU-group selection at load/start time.
+- Models can declare modality capabilities (for example `text`, `audio`) surfaced in `/v1/models`.
 - OpenAI-compatible endpoints for `models`, `chat/completions`, `completions`, `embeddings`, and `batches`.
 - Admin UI for configuration, status, drains, keys, requests, jobs, and events.
 - Demo mock runtimes for local development without GPUs.
@@ -50,6 +52,8 @@ Individual services are also available:
 - JSON and JSONL are observed state.
 - Backends live in runtime folders and can be run with or without Shardon.
 - GPU groups are first-class scheduling targets.
+- A deployment may have one or many eligible GPU groups; Shardon selects one concrete group per running process.
+- Model capabilities are explicit metadata and are independent from request task routing.
 - `keep_free` is enforced aggressively from observed process ownership.
 - Drains are blocking runtime operations, not long-lived reservations.
 - When a request needs another deployment on the same GPU group, idle loaded deployments can be evicted and unloaded first so memory can be reclaimed for the new load.
@@ -73,6 +77,7 @@ Individual services are also available:
 
 - `shardon runtime status`
 - `shardon runtime load --deployment <id>`
+- `shardon runtime load --model <api-model>`
 - `shardon runtime load --model <api-model> --gpu-group <group>`
 - `shardon runtime unload --deployment <id>`
 - `shardon runtime clear-queue [--batches]`
@@ -90,6 +95,14 @@ Runtime timeout defaults:
 - `interactive_request_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `backend_startup_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `queue_poll_interval_seconds` controls how often queued interactive requests retry scheduling decisions while waiting for eviction/startup readiness.
+
+## Multi-Group Deployments
+
+- `deployments` can use `gpu_group_ids` as an ordered preference list; `gpu_group_id` remains supported for backward compatibility.
+- Scheduler admission evaluates each eligible group in order and picks the first admissible group for the deployment.
+- Runtime state records `selected_gpu_group_id` for the concrete running instance.
+- Backends can define `gpu_group_overrides` for per-group `base_url`, `launch_command`, `environment`, and health/startup settings while keeping one backend definition.
+- Only one process is ever launched per deployment id; switching groups unloads the existing process first.
 
 ## Documentation
 

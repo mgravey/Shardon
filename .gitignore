@@ -135,6 +135,8 @@ celerybeat.pid
 /.venv-work/
 state/**/*.bak*
 state/**/*.tmp
+state/**/*.pid
+state/**/*.sock
 config/router.local.yaml
 env/
 venv/
@@ -189,3 +191,4 @@ cython_debug/
 **.DS_Store
 
 .env
+state/**/*.trace

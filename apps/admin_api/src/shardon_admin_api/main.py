@@ -368,12 +368,14 @@ def create_app() -> FastAPI:
             display_name=payload.display_name,
             backend_compatibility=backend_compatibility,
             tasks=payload.tasks,
+            model_capabilities=payload.model_capabilities,
             tokenizer=payload.tokenizer,
             metadata=payload.metadata,
         ).model_dump(mode="json")
 
         deployment_payload: dict[str, Any] | None = None
         if payload.create_deployment:
+            requested_gpu_group_ids = payload.gpu_group_ids or ([payload.gpu_group_id] if payload.gpu_group_id else [])
             missing = [
                 name
                 for name, value in {
@@ -381,10 +383,11 @@ def create_app() -> FastAPI:
                     "api_model_name": payload.api_model_name,
                     "deployment_display_name": payload.deployment_display_name,
                     "backend_runtime_id": payload.backend_runtime_id,
-                    "gpu_group_id": payload.gpu_group_id,
                 }.items()
                 if not value
             ]
+            if not requested_gpu_group_ids:
+                missing.append("gpu_group_id or gpu_group_ids")
             if missing:
                 raise HTTPException(
                     status_code=422,
@@ -392,13 +395,25 @@ def create_app() -> FastAPI:
                 )
             if payload.backend_runtime_id not in runtime.config.backends:
                 raise HTTPException(status_code=404, detail="unknown backend runtime")
-            if payload.gpu_group_id not in runtime.config.gpu_groups:
-                raise HTTPException(status_code=404, detail="unknown gpu group")
+            unknown_gpu_group_ids = [
+                gpu_group_id
+                for gpu_group_id in requested_gpu_group_ids
+                if gpu_group_id not in runtime.config.gpu_groups
+            ]
+            if unknown_gpu_group_ids:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": "unknown gpu group",
+                        "gpu_group_ids": unknown_gpu_group_ids,
+                    },
+                )
             deployment_payload = DeploymentConfig(
                 id=payload.deployment_id,
                 model_id=payload.model_id,
                 backend_runtime_id=payload.backend_runtime_id,
-                gpu_group_id=payload.gpu_group_id,
+                gpu_group_id=requested_gpu_group_ids[0],
+                gpu_group_ids=requested_gpu_group_ids,
                 api_model_name=payload.api_model_name,
                 display_name=payload.deployment_display_name,
                 memory_fraction=payload.memory_fraction,

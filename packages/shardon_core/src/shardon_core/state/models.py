@@ -52,6 +52,8 @@ class DrainState(BaseModel):
 class DeploymentRuntimeState(BaseModel):
     deployment_id: str
     gpu_group_id: str
+    eligible_gpu_group_ids: list[str] = Field(default_factory=list)
+    selected_gpu_group_id: str | None = None
     backend_runtime_id: str
     loaded: bool = False
     state: Literal["unloaded", "starting", "ready", "stopping", "failed"] = "unloaded"

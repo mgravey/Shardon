@@ -138,6 +138,7 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
             "display_name": "New Model",
             "backend_compatibility": ["vllm"],
             "tasks": ["chat"],
+            "model_capabilities": ["text", "audio"],
             "create_deployment": True,
             "deployment_id": "new-model-a",
             "api_model_name": "new-model",
@@ -156,6 +157,7 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     assert resources.status_code == 200
     assert "new-model" in resources.json()["models"]
     assert "new-model-a" in resources.json()["deployments"]
+    assert resources.json()["models"]["new-model"]["model_capabilities"] == ["text", "audio"]
 
     models = router_client.get("/v1/models", headers={"Authorization": f"Bearer {secret}"})
     _assert_no_missing_query_dependencies(models, {"auth", "runtime"})
@@ -163,6 +165,7 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     payload = models.json()
     assert payload["object"] == "list"
     assert any(item["id"] == "demo-chat" for item in payload["data"])
+    assert any(item["id"] == "demo-chat" and item["model_capabilities"] == ["text"] for item in payload["data"])
 
     chat_without_auth = router_client.post(
         "/v1/chat/completions",

@@ -253,3 +253,91 @@ def test_scheduler_allows_swap_when_eviction_restores_free_memory_observation() 
     assert decision.accepted is True
     assert decision.deployment_id == "dep-b"
     assert decision.should_evict == ["dep-a"]
+
+
+def test_scheduler_prefers_first_eligible_group_for_multigroup_deployment() -> None:
+    config = _config()
+    config.gpu_devices["gpu1"] = GPUDeviceConfig(id="gpu1")
+    config.gpu_groups["group-2"] = GPUGroupConfig(
+        id="group-2",
+        display_name="Group 2",
+        gpu_ids=["gpu1"],
+        usable_memory_fraction=0.95,
+    )
+    config.models["model-c"] = ModelConfig(
+        id="model-c",
+        source="/c",
+        display_name="C",
+        backend_compatibility=["vllm"],
+        tasks=["chat"],
+    )
+    config.deployments["dep-c"] = DeploymentConfig(
+        id="dep-c",
+        model_id="model-c",
+        backend_runtime_id="backend-a",
+        gpu_group_ids=["group-1", "group-2"],
+        api_model_name="gamma",
+        display_name="gamma",
+        memory_fraction=0.4,
+        tasks=["chat"],
+    )
+    scheduler = SchedulerEngine(config)
+    decision = scheduler.schedule(
+        SchedulingRequest("gamma", "chat", 100, "interactive", "req-5"),
+        RuntimeStateSnapshot(),
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-c"
+    assert decision.gpu_group_id == "group-1"
+    assert decision.should_load is True
+
+
+def test_scheduler_falls_back_to_next_group_when_preferred_group_is_busy() -> None:
+    config = _config()
+    config.gpu_devices["gpu1"] = GPUDeviceConfig(id="gpu1")
+    config.gpu_groups["group-2"] = GPUGroupConfig(
+        id="group-2",
+        display_name="Group 2",
+        gpu_ids=["gpu1"],
+        usable_memory_fraction=0.95,
+    )
+    config.models["model-c"] = ModelConfig(
+        id="model-c",
+        source="/c",
+        display_name="C",
+        backend_compatibility=["vllm"],
+        tasks=["chat"],
+    )
+    config.deployments["dep-c"] = DeploymentConfig(
+        id="dep-c",
+        model_id="model-c",
+        backend_runtime_id="backend-a",
+        gpu_group_ids=["group-1", "group-2"],
+        api_model_name="gamma",
+        display_name="gamma",
+        memory_fraction=0.4,
+        tasks=["chat"],
+    )
+    snapshot = RuntimeStateSnapshot(
+        deployments={
+            "dep-a": DeploymentRuntimeState(
+                deployment_id="dep-a",
+                gpu_group_id="group-1",
+                selected_gpu_group_id="group-1",
+                backend_runtime_id="backend-a",
+                loaded=True,
+                active_request_ids=["req-busy"],
+                resident_memory_fraction=0.45,
+            )
+        }
+    )
+    scheduler = SchedulerEngine(config)
+    decision = scheduler.schedule(
+        SchedulingRequest("gamma", "chat", 100, "interactive", "req-6"),
+        snapshot,
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-c"
+    assert decision.gpu_group_id == "group-2"

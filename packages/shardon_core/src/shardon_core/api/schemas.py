@@ -75,6 +75,9 @@ class ModelOnboardingRequest(BaseModel):
     display_name: str
     backend_compatibility: list[str]
     tasks: list[Literal["chat", "completion", "embedding"]] = Field(default_factory=list)
+    model_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(
+        default_factory=lambda: ["text"]
+    )
     tokenizer: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     create_deployment: bool = True
@@ -83,6 +86,7 @@ class ModelOnboardingRequest(BaseModel):
     deployment_display_name: str | None = None
     backend_runtime_id: str | None = None
     gpu_group_id: str | None = None
+    gpu_group_ids: list[str] = Field(default_factory=list)
     memory_fraction: float = 0.9
     enabled: bool = True
     priority_weight: int = 100

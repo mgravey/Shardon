@@ -31,6 +31,7 @@ type ModelOnboardingForm = {
   displayName: string;
   tokenizer: string;
   tasks: Array<"chat" | "completion" | "embedding">;
+  modelCapabilities: Array<"text" | "audio" | "image" | "video">;
   backendCompatibility: string[];
   createDeployment: boolean;
   deploymentId: string;
@@ -101,6 +102,7 @@ export default function App() {
     displayName: "Llama 3.1 8B Instruct",
     tokenizer: "",
     tasks: ["chat", "completion"],
+    modelCapabilities: ["text"],
     backendCompatibility: [],
     createDeployment: true,
     deploymentId: "llama-3-1-8b-instruct-a",
@@ -281,6 +283,15 @@ export default function App() {
     }));
   }
 
+  function toggleModelCapability(capability: "text" | "audio" | "image" | "video") {
+    setModelForm((current) => ({
+      ...current,
+      modelCapabilities: current.modelCapabilities.includes(capability)
+        ? current.modelCapabilities.filter((item) => item !== capability)
+        : [...current.modelCapabilities, capability],
+    }));
+  }
+
   function toggleBackendCompatibility(backendId: string) {
     setModelForm((current) => ({
       ...current,
@@ -299,6 +310,7 @@ export default function App() {
         display_name: modelForm.displayName,
         backend_compatibility: modelForm.backendCompatibility,
         tasks: modelForm.tasks,
+        model_capabilities: modelForm.modelCapabilities,
         tokenizer: modelForm.tokenizer || null,
         create_deployment: modelForm.createDeployment,
         deployment_id: modelForm.createDeployment ? modelForm.deploymentId : null,
@@ -485,6 +497,19 @@ export default function App() {
                     onChange={() => toggleTask(task)}
                   />
                   <span>{task}</span>
+                </label>
+              ))}
+            </div>
+            <div className="subhead">Model Capabilities</div>
+            <div className="check-grid">
+              {(["text", "audio", "image", "video"] as const).map((capability) => (
+                <label key={capability} className="check-item">
+                  <input
+                    type="checkbox"
+                    checked={modelForm.modelCapabilities.includes(capability)}
+                    onChange={() => toggleModelCapability(capability)}
+                  />
+                  <span>{capability}</span>
                 </label>
               ))}
             </div>

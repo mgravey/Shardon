@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     load = runtime_subparsers.add_parser("load", help="Manually load a deployment")
     load.add_argument("--deployment", help="Deployment id to load")
     load.add_argument("--model", help="API model alias to resolve")
-    load.add_argument("--gpu-group", help="GPU group id when resolving by model")
+    load.add_argument("--gpu-group", help="Optional GPU group id override when resolving by model")
 
     unload = runtime_subparsers.add_parser("unload", help="Manually unload a deployment")
     unload.add_argument("--deployment", required=True, help="Deployment id to unload")
@@ -85,6 +85,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     if args.command == "runtime" and args.runtime_command == "load":
-        if not args.deployment and not (args.model and args.gpu_group):
-            parser.error("runtime load requires --deployment or --model plus --gpu-group")
+        if not args.deployment and not args.model:
+            parser.error("runtime load requires --deployment or --model")
     raise SystemExit(asyncio.run(_run_async(args)))

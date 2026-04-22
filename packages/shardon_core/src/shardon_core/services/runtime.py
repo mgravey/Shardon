@@ -146,14 +146,24 @@ class ShardonRuntime:
 
     def _seed_snapshot(self, snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
         for deployment in self.config.deployments.values():
-            snapshot.deployments.setdefault(
+            runtime = snapshot.deployments.setdefault(
                 deployment.id,
                 DeploymentRuntimeState(
                     deployment_id=deployment.id,
-                    gpu_group_id=deployment.gpu_group_id,
+                    gpu_group_id=deployment.preferred_gpu_group_id(),
+                    eligible_gpu_group_ids=deployment.eligible_gpu_group_ids(),
+                    selected_gpu_group_id=None,
                     backend_runtime_id=deployment.backend_runtime_id,
                 ),
             )
+            runtime.backend_runtime_id = deployment.backend_runtime_id
+            runtime.eligible_gpu_group_ids = deployment.eligible_gpu_group_ids()
+            if runtime.gpu_group_id not in runtime.eligible_gpu_group_ids:
+                runtime.gpu_group_id = deployment.preferred_gpu_group_id()
+            if runtime.selected_gpu_group_id not in runtime.eligible_gpu_group_ids:
+                runtime.selected_gpu_group_id = None
+            if runtime.loaded and runtime.selected_gpu_group_id is None:
+                runtime.selected_gpu_group_id = runtime.gpu_group_id
         return snapshot
 
     def refresh_gpu_observations(self) -> RuntimeStateSnapshot:
@@ -196,7 +206,11 @@ class ShardonRuntime:
                 for deployment_id, state in snapshot.deployments.items():
                     if state.gpu_group_id != group.id or not state.loaded:
                         continue
-                    self.backends.stop(deployment_id, force=True)
+                    self.backends.stop(
+                        deployment_id,
+                        gpu_group_id=state.selected_gpu_group_id or state.gpu_group_id,
+                        force=True,
+                    )
                     state.loaded = False
                     state.state = "unloaded"
                     state.desired_state = "unloaded"
@@ -216,11 +230,13 @@ class ShardonRuntime:
         return self.state_store.mutate(mutate)
 
     def list_api_models(self) -> list[dict[str, Any]]:
+        snapshot = self.snapshot()
         models: dict[str, dict[str, Any]] = {}
         for deployment in self.config.deployments.values():
             if not deployment.enabled:
                 continue
             model = self.config.models[deployment.model_id]
+            runtime = snapshot.deployments.get(deployment.id)
             models.setdefault(
                 deployment.api_model_name,
                 {
@@ -230,8 +246,11 @@ class ShardonRuntime:
                     "display_name": deployment.display_name,
                     "source_model_id": model.id,
                     "backend_runtime_id": deployment.backend_runtime_id,
-                    "gpu_group_id": deployment.gpu_group_id,
+                    "gpu_group_id": deployment.preferred_gpu_group_id(),
+                    "gpu_group_ids": deployment.eligible_gpu_group_ids(),
+                    "selected_gpu_group_id": runtime.selected_gpu_group_id if runtime is not None else None,
                     "tasks": deployment.tasks,
+                    "model_capabilities": model.model_capabilities,
                 },
             )
         return list(models.values())
@@ -239,40 +258,55 @@ class ShardonRuntime:
     async def refresh_backend_health(self) -> RuntimeStateSnapshot:
         results: dict[str, dict[str, Any]] = {}
         snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
-        loaded_backend_ids = {
-            state.backend_runtime_id
-            for state in snapshot.deployments.values()
-            if state.loaded or state.state == "starting"
-        }
-        for backend_runtime_id in self.config.backends:
-            if backend_runtime_id not in loaded_backend_ids:
-                results[backend_runtime_id] = {
+        for deployment in self.config.deployments.values():
+            runtime_state = snapshot.deployments.get(deployment.id)
+            selected_gpu_group_id = (
+                runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id
+                if runtime_state is not None
+                else deployment.preferred_gpu_group_id()
+            )
+            if runtime_state is None or not (runtime_state.loaded or runtime_state.state == "starting"):
+                results[deployment.id] = {
                     "ok": False,
                     "status": "not_loaded",
                     "checked_at": utc_now_iso(),
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": selected_gpu_group_id,
                 }
                 continue
             try:
-                payload = await self.backends.health(backend_runtime_id)
-                results[backend_runtime_id] = {
+                payload = await self.backends.health(
+                    deployment.backend_runtime_id,
+                    gpu_group_id=selected_gpu_group_id,
+                )
+                results[deployment.id] = {
                     "ok": True,
                     "status": "ready",
                     "checked_at": utc_now_iso(),
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": selected_gpu_group_id,
                     "payload": payload,
                 }
             except Exception as exc:
-                results[backend_runtime_id] = {
+                results[deployment.id] = {
                     "ok": False,
                     "status": "unreachable",
                     "checked_at": utc_now_iso(),
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": selected_gpu_group_id,
                     "error": str(exc),
                 }
-                previous = snapshot.backend_health.get(backend_runtime_id, {})
+                previous = snapshot.backend_health.get(deployment.id, {})
                 if previous.get("status") != "unreachable" or previous.get("error") != str(exc):
                     self.event_logger.emit(
                         "backend.health_failed",
                         "backend health check failed",
-                        backend_runtime_id=backend_runtime_id,
+                        deployment_id=deployment.id,
+                        backend_runtime_id=deployment.backend_runtime_id,
+                        gpu_group_id=selected_gpu_group_id,
                         error=str(exc),
                     )
         return self.state_store.mutate(lambda snapshot: self._set_backend_health(snapshot, results))
@@ -293,22 +327,38 @@ class ShardonRuntime:
                     status_code=404,
                 )
             return deployment
-        if model_name is None or gpu_group_id is None:
+        if model_name is None:
             raise RuntimeOperationError(
                 "missing deployment selector",
-                detail={"error": "provide deployment_id or model_name + gpu_group_id"},
+                detail={"error": "provide deployment_id or model_name"},
                 status_code=422,
             )
         matches = [
             deployment
             for deployment in self.config.deployments.values()
-            if deployment.api_model_name == model_name and deployment.gpu_group_id == gpu_group_id
+            if deployment.api_model_name == model_name
         ]
+        if gpu_group_id is not None:
+            matches = [
+                deployment
+                for deployment in matches
+                if gpu_group_id in deployment.eligible_gpu_group_ids()
+            ]
         if not matches:
             raise RuntimeOperationError(
                 "no matching deployment",
                 detail={"error": "no matching deployment", "model_name": model_name, "gpu_group_id": gpu_group_id},
                 status_code=404,
+            )
+        if len(matches) > 1 and gpu_group_id is None:
+            raise RuntimeOperationError(
+                "ambiguous model selector",
+                detail={
+                    "error": "multiple deployments match model_name; provide deployment_id or gpu_group_id",
+                    "model_name": model_name,
+                    "deployment_ids": [deployment.id for deployment in matches],
+                },
+                status_code=409,
             )
         return matches[0]
 
@@ -325,40 +375,91 @@ class ShardonRuntime:
             model_name=model_name,
             gpu_group_id=gpu_group_id,
         )
+        if gpu_group_id is not None and gpu_group_id not in deployment.eligible_gpu_group_ids():
+            raise RuntimeOperationError(
+                "deployment cannot run on requested gpu group",
+                detail={
+                    "error": "deployment cannot run on requested gpu group",
+                    "deployment_id": deployment.id,
+                    "gpu_group_id": gpu_group_id,
+                    "eligible_gpu_group_ids": deployment.eligible_gpu_group_ids(),
+                },
+                status_code=409,
+            )
         snapshot = self.snapshot()
         runtime_state = snapshot.deployments.get(deployment.id)
-        if runtime_state is not None and runtime_state.loaded:
+        selected_gpu_group_id = (
+            (runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id)
+            if runtime_state is not None
+            else None
+        )
+        if runtime_state is not None and runtime_state.loaded and (
+            gpu_group_id is None or gpu_group_id == selected_gpu_group_id
+        ):
             return {
                 "status": "ok",
                 "detail": "deployment already loaded",
                 "deployment_id": deployment.id,
-                "gpu_group_id": deployment.gpu_group_id,
+                "gpu_group_id": selected_gpu_group_id,
+                "selected_gpu_group_id": selected_gpu_group_id,
             }
-        evict_ids = [
-            item_id
-            for item_id, state in snapshot.deployments.items()
-            if state.gpu_group_id == deployment.gpu_group_id and state.loaded and item_id != deployment.id
-        ]
-        if any(snapshot.deployments[item_id].active_request_ids for item_id in evict_ids):
+        decision = self.scheduler.schedule(
+            SchedulingRequest(
+                model_name=deployment.api_model_name,
+                task=deployment.tasks[0] if deployment.tasks else "chat",
+                priority=10_000,
+                request_class="manual",
+                request_id=f"manual_load_{deployment.id}",
+                deployment_id=deployment.id,
+                target_gpu_group_id=gpu_group_id,
+            ),
+            snapshot,
+            utc_now(),
+        )
+        if not decision.accepted or decision.deployment_id is None or decision.gpu_group_id is None:
             raise RuntimeOperationError(
-                "gpu group is busy",
+                "deployment is not currently admissible",
                 detail={
-                    "error": "gpu group is busy",
-                    "gpu_group_id": deployment.gpu_group_id,
-                    "loaded_deployments": evict_ids,
-                    "active_requests": {
-                        item_id: snapshot.deployments[item_id].active_request_ids for item_id in evict_ids
-                    },
+                    "error": "deployment is not currently admissible",
+                    "deployment_id": deployment.id,
+                    "reason": decision.reason,
+                    **self._build_candidate_status(
+                        model_name=deployment.api_model_name,
+                        task=deployment.tasks[0] if deployment.tasks else "chat",
+                        snapshot=snapshot,
+                    ),
                 },
                 status_code=409,
             )
+        if gpu_group_id is not None and decision.gpu_group_id != gpu_group_id:
+            raise RuntimeOperationError(
+                "requested gpu group is not currently admissible",
+                detail={
+                    "error": "requested gpu group is not currently admissible",
+                    "deployment_id": deployment.id,
+                    "requested_gpu_group_id": gpu_group_id,
+                    "selected_gpu_group_id": decision.gpu_group_id,
+                },
+                status_code=409,
+            )
+        evict_ids = decision.should_evict or []
         self._prepare_group_for_load(evict_ids, reason=f"manual load requested by {actor}")
-        await self._start_and_mark_ready(deployment, reason=f"manual load requested by {actor}")
-        self.event_logger.audit("runtime.load", actor, deployment_id=deployment.id, gpu_group_id=deployment.gpu_group_id)
+        await self._start_and_mark_ready(
+            deployment,
+            selected_gpu_group_id=decision.gpu_group_id,
+            reason=f"manual load requested by {actor}",
+        )
+        self.event_logger.audit(
+            "runtime.load",
+            actor,
+            deployment_id=deployment.id,
+            gpu_group_id=decision.gpu_group_id,
+        )
         return {
             "status": "ok",
             "deployment_id": deployment.id,
-            "gpu_group_id": deployment.gpu_group_id,
+            "gpu_group_id": decision.gpu_group_id,
+            "selected_gpu_group_id": decision.gpu_group_id,
         }
 
     async def unload_deployment(self, deployment_id: str, *, actor: str = "operator") -> dict[str, Any]:
@@ -378,7 +479,11 @@ class ShardonRuntime:
                 status_code=409,
             )
         self._ensure_supervised_process(deployment.id, runtime_state)
-        self.backends.stop(deployment.id, force=False)
+        self.backends.stop(
+            deployment.id,
+            gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+            force=False,
+        )
         self.state_store.mutate(
             lambda state: self._mark_unloaded(
                 state,
@@ -516,6 +621,7 @@ class ShardonRuntime:
                         payload=payload,
                         task=task,
                         auth=auth,
+                        target_gpu_group_id=decision.gpu_group_id or deployment.preferred_gpu_group_id(),
                         should_evict=decision.should_evict or [],
                     )
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
@@ -554,17 +660,58 @@ class ShardonRuntime:
         payload: dict[str, Any],
         task: str,
         auth: AuthResult,
+        target_gpu_group_id: str,
         should_evict: list[str],
     ) -> dict[str, Any]:
         snapshot = self.snapshot()
         current = snapshot.deployments.get(deployment.id)
-        if current is None or not current.loaded:
-            self._prepare_group_for_load(should_evict, reason=f"routing to {deployment.id}")
-            await self._start_and_mark_ready(deployment, reason=f"routing request {request_id}")
-        self.state_store.mutate(
-            lambda state: self._mark_request_running(state, request_id, deployment, auth)
+        current_gpu_group_id = (
+            (current.selected_gpu_group_id or current.gpu_group_id)
+            if current is not None
+            else None
         )
-        adapter = self.backends.adapter_for(deployment.backend_runtime_id)
+        should_start = current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
+        planned_evictions = list(should_evict)
+        if (
+            current is not None
+            and current.loaded
+            and current_gpu_group_id is not None
+            and current_gpu_group_id != target_gpu_group_id
+        ):
+            if current.active_request_ids:
+                raise RuntimeOperationError(
+                    "deployment is busy and cannot switch gpu group",
+                    detail={
+                        "error": "deployment is busy and cannot switch gpu group",
+                        "deployment_id": deployment.id,
+                        "current_gpu_group_id": current_gpu_group_id,
+                        "target_gpu_group_id": target_gpu_group_id,
+                        "active_request_ids": current.active_request_ids,
+                    },
+                    status_code=409,
+                )
+            planned_evictions.append(deployment.id)
+        if should_start:
+            planned_evictions = list(dict.fromkeys(planned_evictions))
+            self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
+            await self._start_and_mark_ready(
+                deployment,
+                selected_gpu_group_id=target_gpu_group_id,
+                reason=f"routing request {request_id}",
+            )
+        self.state_store.mutate(
+            lambda state: self._mark_request_running(
+                state,
+                request_id,
+                deployment,
+                auth,
+                target_gpu_group_id,
+            )
+        )
+        adapter = self.backends.adapter_for(
+            deployment.backend_runtime_id,
+            gpu_group_id=target_gpu_group_id,
+        )
         try:
             if task == "chat":
                 result = await adapter.invoke_chat(payload)
@@ -584,7 +731,7 @@ class ShardonRuntime:
                     "error": "backend request failed",
                     "deployment_id": deployment.id,
                     "backend_runtime_id": deployment.backend_runtime_id,
-                    "gpu_group_id": deployment.gpu_group_id,
+                    "gpu_group_id": target_gpu_group_id,
                     "detail": str(exc),
                 },
                 status_code=409,
@@ -597,13 +744,17 @@ class ShardonRuntime:
             if state is not None and state.loaded and not state.active_request_ids:
                 self.event_logger.emit(
                     "deployment.evict",
-                    "evicting deployment before loading another on the same gpu group",
+                    "evicting deployment before loading target deployment",
                     deployment_id=deployment_id,
-                    gpu_group_id=state.gpu_group_id,
+                    gpu_group_id=state.selected_gpu_group_id or state.gpu_group_id,
                     reason=reason,
                 )
                 self._ensure_supervised_process(deployment_id, state)
-                self.backends.stop(deployment_id, force=False)
+                self.backends.stop(
+                    deployment_id,
+                    gpu_group_id=state.selected_gpu_group_id or state.gpu_group_id,
+                    force=False,
+                )
                 self.state_store.mutate(
                     lambda current: self._mark_unloaded(current, deployment_id, reason=reason)
                 )
@@ -613,9 +764,10 @@ class ShardonRuntime:
             return
         if runtime_state.process_id is None:
             return
-        backend = self.config.backends.get(runtime_state.backend_runtime_id)
-        if backend is None:
+        if runtime_state.backend_runtime_id not in self.config.backends:
             return
+        gpu_group_id = runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id
+        backend = self.backends.resolve_backend(runtime_state.backend_runtime_id, gpu_group_id=gpu_group_id)
         self.backends.supervisor.adopt(
             deployment_id=deployment_id,
             pid=runtime_state.process_id,
@@ -674,22 +826,42 @@ class ShardonRuntime:
                 break
         return snapshot
 
-    async def _start_and_mark_ready(self, deployment: DeploymentConfig, *, reason: str) -> None:
+    async def _start_and_mark_ready(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        selected_gpu_group_id: str,
+        reason: str,
+    ) -> None:
         self.state_store.mutate(
-            lambda state: self._mark_starting(state, deployment, reason=reason)
+            lambda state: self._mark_starting(
+                state,
+                deployment,
+                selected_gpu_group_id=selected_gpu_group_id,
+                reason=reason,
+            )
         )
         try:
-            readiness = await self.backends.ensure_started_and_ready(deployment)
+            readiness = await self.backends.ensure_started_and_ready(
+                deployment,
+                gpu_group_id=selected_gpu_group_id,
+            )
         except BackendOperationError as exc:
             self.state_store.mutate(
-                lambda state: self._mark_start_failed(state, deployment, detail=exc.detail, reason=reason)
+                lambda state: self._mark_start_failed(
+                    state,
+                    deployment,
+                    selected_gpu_group_id=selected_gpu_group_id,
+                    detail=exc.detail,
+                    reason=reason,
+                )
             )
             raise RuntimeOperationError(
                 "backend failed to start cleanly",
                 detail={
                     "error": "backend failed to start cleanly",
                     "deployment_id": deployment.id,
-                    "gpu_group_id": deployment.gpu_group_id,
+                    "gpu_group_id": selected_gpu_group_id,
                     "backend_runtime_id": deployment.backend_runtime_id,
                     "reason": reason,
                     "readiness": exc.detail,
@@ -700,7 +872,8 @@ class ShardonRuntime:
             lambda state: self._mark_loaded(
                 state,
                 deployment,
-                readiness["pid"],
+                selected_gpu_group_id=selected_gpu_group_id,
+                pid=readiness["pid"],
                 reason=reason,
                 readiness_detail=readiness,
             )
@@ -710,20 +883,23 @@ class ShardonRuntime:
         self,
         snapshot: RuntimeStateSnapshot,
         deployment: DeploymentConfig,
-        pid: int,
         *,
+        selected_gpu_group_id: str,
+        pid: int,
         reason: str,
         readiness_detail: dict[str, Any],
     ) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         runtime = snapshot.deployments[deployment.id]
         runtime.loaded = True
+        runtime.gpu_group_id = selected_gpu_group_id
+        runtime.selected_gpu_group_id = selected_gpu_group_id
         runtime.state = "ready"
         runtime.desired_state = "loaded"
         runtime.loaded_at = utc_now_iso()
         runtime.readiness_passed_at = readiness_detail.get("ready_at", utc_now_iso())
         runtime.process_id = pid
-        runtime.resident_memory_fraction = deployment.memory_fraction
+        runtime.resident_memory_fraction = deployment.memory_fraction_for_group(selected_gpu_group_id)
         runtime.current_model_name = deployment.api_model_name
         runtime.last_error = None
         runtime.last_transition_reason = reason
@@ -735,10 +911,13 @@ class ShardonRuntime:
         snapshot: RuntimeStateSnapshot,
         deployment: DeploymentConfig,
         *,
+        selected_gpu_group_id: str,
         reason: str,
     ) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         runtime = snapshot.deployments[deployment.id]
+        runtime.gpu_group_id = selected_gpu_group_id
+        runtime.selected_gpu_group_id = selected_gpu_group_id
         runtime.state = "starting"
         runtime.desired_state = "loaded"
         runtime.startup_started_at = utc_now_iso()
@@ -752,12 +931,15 @@ class ShardonRuntime:
         snapshot: RuntimeStateSnapshot,
         deployment: DeploymentConfig,
         *,
+        selected_gpu_group_id: str,
         detail: dict[str, Any],
         reason: str,
     ) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         runtime = snapshot.deployments[deployment.id]
         runtime.loaded = False
+        runtime.gpu_group_id = selected_gpu_group_id
+        runtime.selected_gpu_group_id = None
         runtime.state = "failed"
         runtime.desired_state = "unloaded"
         runtime.process_id = None
@@ -778,6 +960,7 @@ class ShardonRuntime:
         runtime.loaded = False
         runtime.state = "unloaded"
         runtime.desired_state = "unloaded"
+        runtime.selected_gpu_group_id = None
         runtime.process_id = None
         runtime.resident_memory_fraction = 0.0
         runtime.active_request_ids = []
@@ -790,6 +973,7 @@ class ShardonRuntime:
         request_id: str,
         deployment: DeploymentConfig,
         auth: AuthResult,
+        selected_gpu_group_id: str,
     ) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         queued = next((item for item in snapshot.queued_requests if item.id == request_id), None)
@@ -801,11 +985,13 @@ class ShardonRuntime:
             )
         queued.deployment_id = deployment.id
         queued.backend_runtime_id = deployment.backend_runtime_id
-        queued.gpu_group_id = deployment.gpu_group_id
+        queued.gpu_group_id = selected_gpu_group_id
         queued.status = "running"
         queued.started_at = utc_now_iso()
         snapshot.active_requests[request_id] = queued
         runtime = snapshot.deployments[deployment.id]
+        runtime.gpu_group_id = selected_gpu_group_id
+        runtime.selected_gpu_group_id = selected_gpu_group_id
         if request_id not in runtime.active_request_ids:
             runtime.active_request_ids.append(request_id)
         runtime.last_used_at = utc_now_iso()
@@ -815,7 +1001,7 @@ class ShardonRuntime:
             auth.user_name,
             request_id=request_id,
             deployment_id=deployment.id,
-            gpu_group_id=deployment.gpu_group_id,
+            gpu_group_id=selected_gpu_group_id,
         )
         return snapshot
 
@@ -907,13 +1093,21 @@ class ShardonRuntime:
         if not decision.accepted or decision.deployment_id is None:
             return
         deployment = self.config.deployments[decision.deployment_id]
+        selected_gpu_group_id = decision.gpu_group_id or deployment.preferred_gpu_group_id()
         if decision.should_load:
             self._prepare_group_for_load(
                 decision.should_evict or [],
                 reason=f"batch scheduling for {job.id}",
             )
-            await self._start_and_mark_ready(deployment, reason=f"batch scheduling for {job.id}")
-        adapter = self.backends.adapter_for(deployment.backend_runtime_id)
+            await self._start_and_mark_ready(
+                deployment,
+                selected_gpu_group_id=selected_gpu_group_id,
+                reason=f"batch scheduling for {job.id}",
+            )
+        adapter = self.backends.adapter_for(
+            deployment.backend_runtime_id,
+            gpu_group_id=selected_gpu_group_id,
+        )
         self.state_store.mutate(lambda state: self._mark_batch_running(state, job.id, deployment.id))
         requests = job.metadata.get("requests", [])
         completed = 0
@@ -992,7 +1186,12 @@ class ShardonRuntime:
             ]
             if not active:
                 for deployment_id in loaded_in_group:
-                    self.backends.stop(deployment_id, force=True)
+                    runtime_state = snapshot.deployments[deployment_id]
+                    self.backends.stop(
+                        deployment_id,
+                        gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+                        force=True,
+                    )
                     self.state_store.mutate(
                         lambda state: self._mark_unloaded(
                             state,
@@ -1012,7 +1211,12 @@ class ShardonRuntime:
             if state.gpu_group_id == gpu_group_id and state.loaded
         ]
         for deployment_id in loaded_in_group:
-            self.backends.stop(deployment_id, force=True)
+            runtime_state = snapshot.deployments[deployment_id]
+            self.backends.stop(
+                deployment_id,
+                gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+                force=True,
+            )
             self.state_store.mutate(
                 lambda state: self._mark_unloaded(
                     state,
@@ -1058,17 +1262,28 @@ class ShardonRuntime:
         candidate_details: list[dict[str, Any]] = []
         for deployment in candidates:
             runtime = snapshot.deployments.get(deployment.id)
+            selected_gpu_group_id = (
+                (runtime.selected_gpu_group_id or runtime.gpu_group_id)
+                if runtime is not None
+                else None
+            )
             candidate_details.append(
                 {
                     "deployment_id": deployment.id,
-                    "gpu_group_id": deployment.gpu_group_id,
+                    "gpu_group_id": deployment.preferred_gpu_group_id(),
+                    "gpu_group_ids": deployment.eligible_gpu_group_ids(),
+                    "selected_gpu_group_id": selected_gpu_group_id,
                     "backend_runtime_id": deployment.backend_runtime_id,
                     "loaded": runtime.loaded if runtime is not None else False,
                     "state": runtime.state if runtime is not None else "unloaded",
                     "active_request_ids": runtime.active_request_ids if runtime is not None else [],
                     "last_error": runtime.last_error if runtime is not None else None,
                     "last_transition_reason": runtime.last_transition_reason if runtime is not None else None,
-                    "gpu_group_status": self._gpu_group_summary(deployment.gpu_group_id, snapshot),
+                    "gpu_group_statuses": {
+                        gpu_group_id: self._gpu_group_summary(gpu_group_id, snapshot)
+                        for gpu_group_id in deployment.eligible_gpu_group_ids()
+                        if gpu_group_id in self.config.gpu_groups
+                    },
                 }
             )
         return {"candidate_deployments": candidate_details}

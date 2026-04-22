@@ -7,7 +7,8 @@ backend_compatibility:
 tasks:
   - chat
   - completion
+model_capabilities:
+  - text
 tokenizer: demo-chat-tokenizer
 metadata:
   family: demo
-

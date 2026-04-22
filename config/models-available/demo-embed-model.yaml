@@ -5,7 +5,8 @@ backend_compatibility:
   - sglang
 tasks:
   - embedding
+model_capabilities:
+  - text
 tokenizer: demo-embed-tokenizer
 metadata:
   family: demo
-

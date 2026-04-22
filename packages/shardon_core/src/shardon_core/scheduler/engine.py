@@ -26,6 +26,8 @@ class SchedulingRequest:
     priority: int
     request_class: str
     request_id: str
+    deployment_id: str | None = None
+    target_gpu_group_id: str | None = None
 
 
 class SchedulerEngine:
@@ -39,71 +41,131 @@ class SchedulerEngine:
         snapshot: RuntimeStateSnapshot,
         now: datetime,
     ) -> SchedulingDecision:
-        candidates = [
+        candidates = self._matching_deployments(request)
+        if not candidates:
+            return SchedulingDecision(False, None, None, None, 404, "no compatible deployment")
+
+        loaded_candidates = [
+            deployment
+            for deployment in candidates
+            if snapshot.deployments.get(deployment.id, None) and snapshot.deployments[deployment.id].loaded
+        ]
+        if request.request_class == "batch":
+            loaded_batch = self._pick_best_loaded(loaded_candidates, snapshot)
+            if loaded_batch is not None:
+                loaded_group = self._deployment_selected_group(
+                    loaded_batch.id,
+                    snapshot,
+                    default=loaded_batch.preferred_gpu_group_id(),
+                )
+                if request.target_gpu_group_id is None or request.target_gpu_group_id == loaded_group:
+                    return SchedulingDecision(
+                        True,
+                        loaded_batch.id,
+                        loaded_batch.backend_runtime_id,
+                        loaded_group,
+                        200,
+                        "batch scheduled on loaded deployment",
+                    )
+        else:
+            loaded = self._pick_best_loaded(loaded_candidates, snapshot)
+            if loaded is not None:
+                loaded_group = self._deployment_selected_group(
+                    loaded.id,
+                    snapshot,
+                    default=loaded.preferred_gpu_group_id(),
+                )
+                if self._group_is_draining(loaded_group, snapshot):
+                    loaded = None
+            if loaded is not None and (
+                request.target_gpu_group_id is None or request.target_gpu_group_id == loaded_group
+            ):
+                return SchedulingDecision(
+                    True,
+                    loaded.id,
+                    loaded.backend_runtime_id,
+                    loaded_group,
+                    200,
+                    "reusing loaded deployment",
+                )
+
+        for deployment in candidates:
+            deployment_state = snapshot.deployments.get(deployment.id)
+            group_candidates = (
+                [request.target_gpu_group_id]
+                if request.target_gpu_group_id is not None
+                else deployment.eligible_gpu_group_ids()
+            )
+            for gpu_group_id in group_candidates:
+                if gpu_group_id is None:
+                    continue
+                if gpu_group_id not in deployment.eligible_gpu_group_ids():
+                    continue
+                if gpu_group_id not in self.config.gpu_groups:
+                    continue
+                if self._group_is_draining(gpu_group_id, snapshot):
+                    continue
+                loaded_here = self._loaded_in_group(gpu_group_id, snapshot)
+                self_evict = self._self_evict_if_needed(deployment.id, gpu_group_id, snapshot)
+                if self_evict and deployment_state is not None and deployment_state.active_request_ids:
+                    continue
+                assumed_evictions = self._dedupe_ids([*loaded_here, *self_evict])
+                busy_evictions = [
+                    deployment_id
+                    for deployment_id in assumed_evictions
+                    if deployment_id != deployment.id
+                    and snapshot.deployments.get(deployment_id, None)
+                    and snapshot.deployments[deployment_id].active_request_ids
+                ]
+                if busy_evictions:
+                    continue
+                can_switch = (
+                    not loaded_here
+                    or self._can_switch(
+                        gpu_group_id,
+                        request.priority,
+                        snapshot,
+                        now,
+                        bypass_grace_window=request.request_class == "manual",
+                    )
+                )
+                if request.request_class == "batch" and loaded_here:
+                    continue
+                if loaded_here and not can_switch:
+                    continue
+                group = self.config.gpu_groups[gpu_group_id]
+                if not self._group_allows_admission(
+                    group,
+                    deployment,
+                    snapshot,
+                    assumed_evictions=assumed_evictions,
+                ):
+                    continue
+                return SchedulingDecision(
+                    True,
+                    deployment.id,
+                    deployment.backend_runtime_id,
+                    gpu_group_id,
+                    200,
+                    "deployment selected",
+                    should_load=True,
+                    should_evict=assumed_evictions,
+                )
+        return SchedulingDecision(False, None, None, None, 409, "no deployment currently admissible")
+
+    def _matching_deployments(self, request: SchedulingRequest) -> list[DeploymentConfig]:
+        if request.deployment_id is not None:
+            deployment = self.config.deployments.get(request.deployment_id)
+            if deployment is None or not deployment.enabled:
+                return []
+            return [deployment]
+        return [
             deployment
             for deployment in self.config.deployments.values()
             if deployment.enabled
             and deployment.api_model_name == request.model_name
             and request.task in deployment.tasks
         ]
-        if not candidates:
-            return SchedulingDecision(False, None, None, None, 404, "no compatible deployment")
-
-        loaded_candidates = [
-            deployment for deployment in candidates if snapshot.deployments.get(deployment.id, None) and
-            snapshot.deployments[deployment.id].loaded
-        ]
-        if request.request_class == "batch":
-            loaded_batch = self._pick_best_loaded(loaded_candidates, snapshot)
-            if loaded_batch is not None:
-                return SchedulingDecision(
-                    True,
-                    loaded_batch.id,
-                    loaded_batch.backend_runtime_id,
-                    loaded_batch.gpu_group_id,
-                    200,
-                    "batch scheduled on loaded deployment",
-                )
-        else:
-            loaded = self._pick_best_loaded(loaded_candidates, snapshot)
-            if loaded is not None and not self._group_is_draining(loaded.gpu_group_id, snapshot):
-                return SchedulingDecision(
-                    True,
-                    loaded.id,
-                    loaded.backend_runtime_id,
-                    loaded.gpu_group_id,
-                    200,
-                    "reusing loaded deployment",
-                )
-
-        for deployment in candidates:
-            if self._group_is_draining(deployment.gpu_group_id, snapshot):
-                continue
-            group = self.config.gpu_groups[deployment.gpu_group_id]
-            loaded_here = self._loaded_in_group(group.id, snapshot)
-            can_switch = not loaded_here or self._can_switch(group.id, request.priority, snapshot, now)
-            if request.request_class == "batch" and loaded_here:
-                continue
-            if loaded_here and not can_switch:
-                continue
-            if not self._group_allows_admission(
-                group,
-                deployment,
-                snapshot,
-                assumed_evictions=loaded_here if can_switch else [],
-            ):
-                continue
-            return SchedulingDecision(
-                True,
-                deployment.id,
-                deployment.backend_runtime_id,
-                deployment.gpu_group_id,
-                200,
-                "deployment selected",
-                should_load=True,
-                should_evict=loaded_here,
-            )
-        return SchedulingDecision(False, None, None, None, 409, "no deployment currently admissible")
 
     def _pick_best_loaded(
         self,
@@ -127,6 +189,39 @@ class SchedulerEngine:
             if state.gpu_group_id == gpu_group_id and state.loaded
         ]
 
+    def _deployment_selected_group(
+        self,
+        deployment_id: str,
+        snapshot: RuntimeStateSnapshot,
+        *,
+        default: str,
+    ) -> str:
+        state = snapshot.deployments.get(deployment_id)
+        if state is None:
+            return default
+        return state.selected_gpu_group_id or state.gpu_group_id or default
+
+    def _self_evict_if_needed(
+        self,
+        deployment_id: str,
+        target_gpu_group_id: str,
+        snapshot: RuntimeStateSnapshot,
+    ) -> list[str]:
+        state = snapshot.deployments.get(deployment_id)
+        if state is None or not state.loaded:
+            return []
+        selected_gpu_group_id = state.selected_gpu_group_id or state.gpu_group_id
+        if selected_gpu_group_id == target_gpu_group_id:
+            return []
+        return [deployment_id]
+
+    def _dedupe_ids(self, values: list[str]) -> list[str]:
+        deduped: list[str] = []
+        for value in values:
+            if value not in deduped:
+                deduped.append(value)
+        return deduped
+
     def _group_is_draining(self, gpu_group_id: str, snapshot: RuntimeStateSnapshot) -> bool:
         drain = snapshot.drains.get(gpu_group_id)
         return drain is not None and drain.status == "pending"
@@ -142,6 +237,7 @@ class SchedulerEngine:
         observation_totals = [snapshot.gpu_observations.get(gpu_id) for gpu_id in group.gpu_ids]
         if not observation_totals:
             return True
+        deployment_memory_fraction = deployment.memory_fraction_for_group(group.id)
         memory_limit = group.usable_memory_fraction
         currently_reserved = sum(
             state.resident_memory_fraction
@@ -152,16 +248,17 @@ class SchedulerEngine:
             snapshot.deployments[deployment_id].resident_memory_fraction
             for deployment_id in assumed_evictions
             if deployment_id in snapshot.deployments
+            and snapshot.deployments[deployment_id].gpu_group_id == group.id
         )
         effective_reserved = max(0.0, currently_reserved - reclaimable_fraction)
-        if effective_reserved + deployment.memory_fraction > memory_limit:
+        if effective_reserved + deployment_memory_fraction > memory_limit:
             return False
         for observation in observation_totals:
             if observation is None:
                 continue
             free_fraction = observation.free_memory_mb / max(observation.total_memory_mb, 1)
             effective_free_fraction = min(1.0, free_fraction + reclaimable_fraction)
-            if effective_free_fraction < (1 - deployment.memory_fraction) * 0.5:
+            if effective_free_fraction < (1 - deployment_memory_fraction) * 0.5:
                 return False
         return True
 
@@ -171,7 +268,11 @@ class SchedulerEngine:
         incoming_priority: int,
         snapshot: RuntimeStateSnapshot,
         now: datetime,
+        *,
+        bypass_grace_window: bool = False,
     ) -> bool:
+        if bypass_grace_window:
+            return True
         loaded_model_names = {
             self.config.deployments[deployment_id].api_model_name
             for deployment_id in self._loaded_in_group(gpu_group_id, snapshot)

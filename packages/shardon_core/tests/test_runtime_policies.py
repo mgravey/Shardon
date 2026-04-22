@@ -7,10 +7,27 @@ from shardon_core.services.runtime import ShardonRuntime
 from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, GPUProcessInfo
 
 
+def _source_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "config").exists():
+            return parent
+    raise RuntimeError("repository root with config/ not found")
+
+
 def _copy_repo_fixture(tmp_path: Path) -> Path:
-    source_root = Path(__file__).resolve().parents[4]
+    source_root = _source_repo_root()
     target_root = tmp_path / "repo"
     shutil.copytree(source_root / "config", target_root / "config")
+    for directory_name in ("admins-available", "admins-enabled"):
+        admin_dir = target_root / "config" / "auth" / directory_name
+        for admin_user in admin_dir.glob("*.yaml"):
+            lines = []
+            for line in admin_user.read_text(encoding="utf-8").splitlines():
+                if line.startswith("created_at: "):
+                    created_at = line.removeprefix("created_at: ").strip()
+                    line = f'created_at: "{created_at}"'
+                lines.append(line)
+            admin_user.write_text("\n".join(lines) + "\n", encoding="utf-8")
     (target_root / "state").mkdir(parents=True, exist_ok=True)
     return target_root
 
@@ -47,7 +64,9 @@ def test_keep_free_kills_loaded_runtime_on_other_user_activity(tmp_path: Path) -
         ]
     )
     stopped: list[str] = []
-    runtime.backends.stop = lambda deployment_id, force=False: stopped.append(deployment_id)  # type: ignore[method-assign]
+    runtime.backends.stop = (  # type: ignore[method-assign]
+        lambda deployment_id, gpu_group_id=None, force=False: stopped.append(deployment_id)
+    )
     runtime.refresh_gpu_observations()
     snapshot = runtime.enforce_keep_free()
     assert stopped == ["chat-b"]
@@ -91,8 +110,9 @@ def test_drain_force_kills_after_timeout(tmp_path: Path) -> None:
         )
     )
     stopped: list[str] = []
-    runtime.backends.stop = lambda deployment_id, force=False: stopped.append(deployment_id)  # type: ignore[method-assign]
+    runtime.backends.stop = (  # type: ignore[method-assign]
+        lambda deployment_id, gpu_group_id=None, force=False: stopped.append(deployment_id)
+    )
     drain = asyncio.run(runtime.drain_group("group-b", 0))
     assert drain.status == "forced"
     assert stopped == ["chat-b"]
-

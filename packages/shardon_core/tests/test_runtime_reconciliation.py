@@ -92,7 +92,8 @@ def test_refresh_backend_health_deduplicates_repeated_failure_events(tmp_path: P
             )
         )
 
-        async def failing_health(backend_runtime_id: str) -> dict[str, str]:
+        async def failing_health(backend_runtime_id: str, *, gpu_group_id: str | None = None) -> dict[str, str]:
+            _ = gpu_group_id
             raise RuntimeError("All connection attempts failed")
 
         runtime.backends.health = failing_health  # type: ignore[method-assign]
