@@ -80,6 +80,7 @@ Individual services are also available:
   - `POST /v1/audio/transcriptions`
   - `POST /v1/audio/translations`
 - Transcription/translation accept multipart uploads and preserve text-style response formats (`text`, `srt`, `vtt`) at the API boundary.
+- Router dependencies include `python-multipart` so a fresh `./scripts/bootstrap.sh` install can register multipart audio routes without manual pip installs.
 - Backend adapters are modality-aware and include extension points for non-OpenAI-native backends (for example WhisperX) and future video operations without changing scheduler/runtime contracts.
 
 ## Runtime Operator Commands

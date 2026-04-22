@@ -193,3 +193,4 @@ cython_debug/
 
 .env
 state/**/*.trace
+bootstrap.log

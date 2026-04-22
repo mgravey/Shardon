@@ -11,3 +11,5 @@
 - Added WhisperX adapter translation layer for OpenAI-compatible transcription/translation outputs.
 - Added first-class modality metadata on models/deployments/backends (`text`, `audio`, `image`, `video`) and capability-aware candidate filtering.
 - Added regression coverage for dependency binding and audio JSON/multipart routes, plus scheduler/config capability behavior.
+- Added `python-multipart` to `shardon-router-api` package dependencies so multipart audio routes start cleanly after standard bootstrap.
+- Added regression checks to ensure router multipart dependency is declared and bootstrap keeps syncing all workspace packages.
