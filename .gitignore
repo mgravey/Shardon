@@ -135,6 +135,7 @@ celerybeat.pid
 /.venv-work/
 state/**/*.bak*
 state/**/*.tmp
+state/logs/*.tmp
 state/**/*.pid
 state/**/*.sock
 state/audio/

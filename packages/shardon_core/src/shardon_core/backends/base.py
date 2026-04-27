@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -28,6 +29,7 @@ class ManagedProcess:
     command: list[str]
     log_path: Path
     started_at: str
+    process: subprocess.Popen[Any] | None = None
 
 
 @dataclass(slots=True)
@@ -78,6 +80,7 @@ class ProcessSupervisor:
             command=backend.launch_command,
             log_path=log_path,
             started_at=utc_now_iso(),
+            process=process,
         )
         self.processes[deployment.id] = managed
         return managed
@@ -101,6 +104,7 @@ class ProcessSupervisor:
             command=command,
             log_path=log_path,
             started_at=started_at or utc_now_iso(),
+            process=None,
         )
         self.processes[deployment_id] = managed
         return managed
@@ -108,6 +112,23 @@ class ProcessSupervisor:
     def stop(self, deployment_id: str, timeout: float = 10.0) -> None:
         managed = self.processes.get(deployment_id)
         if managed is None:
+            return
+        if managed.process is not None:
+            try:
+                managed.process.terminate()
+            except ProcessLookupError:
+                self.processes.pop(deployment_id, None)
+                return
+            try:
+                managed.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    managed.process.kill()
+                except ProcessLookupError:
+                    pass
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    managed.process.wait(timeout=1.0)
+            self.processes.pop(deployment_id, None)
             return
         try:
             os.kill(managed.pid, signal.SIGTERM)
@@ -132,6 +153,15 @@ class ProcessSupervisor:
         managed = self.processes.get(deployment_id)
         if managed is None:
             return
+        if managed.process is not None:
+            try:
+                managed.process.kill()
+            except ProcessLookupError:
+                pass
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                managed.process.wait(timeout=1.0)
+            self.processes.pop(deployment_id, None)
+            return
         try:
             os.kill(managed.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -141,6 +171,11 @@ class ProcessSupervisor:
     def is_running(self, deployment_id: str) -> bool:
         managed = self.processes.get(deployment_id)
         if managed is None:
+            return False
+        if managed.process is not None:
+            if managed.process.poll() is None:
+                return True
+            self.processes.pop(deployment_id, None)
             return False
         try:
             os.kill(managed.pid, 0)

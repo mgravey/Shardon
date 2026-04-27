@@ -74,6 +74,7 @@ Individual services are also available:
 - Non-JSON `2xx` responses (for example plain-text `/health` from some vLLM builds) are accepted and stored with status metadata instead of failing readiness.
 - On startup and periodic health refresh, loaded runtime state is reconciled with live process IDs so stale loaded flags are cleared.
 - Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
+- Backend stop timeout is a maximum cap: if the process exits immediately after `SIGTERM`, Shardon proceeds without waiting for the full timeout window.
 
 ## Multimodal Routing
 
