@@ -150,6 +150,8 @@ class ModelConfig(BaseModel):
     model_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(
         default_factory=lambda: ["text"]
     )
+    runtime_launch_args: list[str] = Field(default_factory=list)
+    runtime_launch_args_by_backend_type: dict[str, list[str]] = Field(default_factory=dict)
     tokenizer: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -160,6 +162,16 @@ class ModelConfig(BaseModel):
             if capability not in deduped:
                 deduped.append(capability)
         self.model_capabilities = deduped or ["text"]
+        self.runtime_launch_args = [str(item) for item in self.runtime_launch_args if str(item).strip()]
+        normalized_by_backend: dict[str, list[str]] = {}
+        for backend_type, values in self.runtime_launch_args_by_backend_type.items():
+            key = str(backend_type).strip()
+            if not key:
+                continue
+            normalized_values = [str(item) for item in values if str(item).strip()]
+            if normalized_values:
+                normalized_by_backend[key] = normalized_values
+        self.runtime_launch_args_by_backend_type = normalized_by_backend
         return self
 
 

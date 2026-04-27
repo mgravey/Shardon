@@ -45,3 +45,22 @@ def test_model_config_accepts_audio_tasks() -> None:
         model_capabilities=["audio"],
     )
     assert model.tasks == ["audio_transcription", "audio_translation"]
+
+
+def test_model_config_normalizes_runtime_launch_args() -> None:
+    model = ModelConfig(
+        id="qwen-model",
+        source="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        display_name="Qwen",
+        backend_compatibility=["vllm"],
+        tasks=["chat"],
+        runtime_launch_args=["--enable-auto-tool-choice", "", "  "],
+        runtime_launch_args_by_backend_type={
+            " vllm ": ["--tool-call-parser", "qwen3_coder", ""],
+            "": ["--ignored"],
+        },
+    )
+    assert model.runtime_launch_args == ["--enable-auto-tool-choice"]
+    assert model.runtime_launch_args_by_backend_type == {
+        "vllm": ["--tool-call-parser", "qwen3_coder"],
+    }

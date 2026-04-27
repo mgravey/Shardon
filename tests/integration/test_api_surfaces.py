@@ -140,6 +140,7 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
             "backend_compatibility": ["vllm"],
             "tasks": ["chat"],
             "model_capabilities": ["text", "audio"],
+            "runtime_launch_args_by_backend_type": {"vllm": ["--enable-prefix-caching"]},
             "create_deployment": True,
             "deployment_id": "new-model-a",
             "api_model_name": "new-model",
@@ -159,6 +160,9 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     assert "new-model" in resources.json()["models"]
     assert "new-model-a" in resources.json()["deployments"]
     assert resources.json()["models"]["new-model"]["model_capabilities"] == ["text", "audio"]
+    assert resources.json()["models"]["new-model"]["runtime_launch_args_by_backend_type"] == {
+        "vllm": ["--enable-prefix-caching"]
+    }
 
     models = router_client.get("/v1/models", headers={"Authorization": f"Bearer {secret}"})
     _assert_no_missing_query_dependencies(models, {"auth", "runtime"})

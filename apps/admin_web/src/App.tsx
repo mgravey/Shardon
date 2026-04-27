@@ -30,6 +30,7 @@ type ModelOnboardingForm = {
   source: string;
   displayName: string;
   tokenizer: string;
+  runtimeLaunchArgsText: string;
   tasks: Array<
     "chat" | "completion" | "embedding" | "audio_speech" | "audio_transcription" | "audio_translation"
   >;
@@ -105,6 +106,7 @@ export default function App() {
     source: "meta-llama/Llama-3.1-8B-Instruct",
     displayName: "Llama 3.1 8B Instruct",
     tokenizer: "",
+    runtimeLaunchArgsText: "",
     tasks: ["chat", "completion"],
     modelCapabilities: ["text"],
     backendCompatibility: [],
@@ -308,6 +310,10 @@ export default function App() {
   }
 
   async function submitModelOnboarding() {
+    const runtimeLaunchArgs = modelForm.runtimeLaunchArgsText
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
     await api("/workflows/model-onboarding", token, {
       method: "POST",
       body: JSON.stringify({
@@ -317,6 +323,7 @@ export default function App() {
         backend_compatibility: modelForm.backendCompatibility,
         tasks: modelForm.tasks,
         model_capabilities: modelForm.modelCapabilities,
+        runtime_launch_args: runtimeLaunchArgs,
         tokenizer: modelForm.tokenizer || null,
         create_deployment: modelForm.createDeployment,
         deployment_id: modelForm.createDeployment ? modelForm.deploymentId : null,
@@ -494,6 +501,17 @@ export default function App() {
                 value={modelForm.tokenizer}
                 onChange={(event) => setModelForm((current) => ({ ...current, tokenizer: event.target.value }))}
                 placeholder="optional tokenizer override"
+              />
+            </label>
+            <label>
+              Runtime Launch Args (one per line)
+              <textarea
+                value={modelForm.runtimeLaunchArgsText}
+                onChange={(event) =>
+                  setModelForm((current) => ({ ...current, runtimeLaunchArgsText: event.target.value }))
+                }
+                rows={6}
+                placeholder={"--enable-auto-tool-choice\n--tool-call-parser\nqwen3_coder"}
               />
             </label>
             <div className="check-grid">

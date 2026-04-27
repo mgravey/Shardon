@@ -20,6 +20,23 @@ Shardon now treats symlinks as the default operational model: enabled entries sh
 - Backend `capabilities` should explicitly include modality metadata (`modalities`) and operation flags (for example `audio_speech`, `audio_transcriptions`, `audio_translations`) so routing can filter candidates correctly.
 - Models define logical identity, source, tokenizer, display metadata, and backend compatibility.
 - Models can also define `model_capabilities` (for example `text`, `audio`, `image`, `video`) for modality-aware routing and visibility in `/v1/models`.
+- Models can define per-model runtime launch flags:
+  - `runtime_launch_args`: appended for every backend launch of that model.
+  - `runtime_launch_args_by_backend_type`: appended only for matching backend types (for example `vllm`).
+  Example:
+  ```yaml
+  runtime_launch_args_by_backend_type:
+    vllm:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+      - --enable-prefix-caching
+      - --quantization
+      - compressed-tensors
+      - --speculative-config={"method":"mtp","num_speculative_tokens":3}
+  ```
 - Deployments bind model plus backend runtime plus API-visible alias and memory budget.
 - Deployments can optionally define `deployment_capabilities` to narrow a model/backend pair to a subset of modalities for that deployment.
 - Deployments can declare one group (`gpu_group_id`) or an ordered list (`gpu_group_ids`); Shardon chooses one concrete group at load/start time.

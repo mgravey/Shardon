@@ -108,3 +108,46 @@ def test_backend_registry_start_uses_selected_gpu_group(tmp_path: Path) -> None:
     assert captured["base_url"] == "http://127.0.0.1:8101"
     assert captured["launch_command"] == ["python3", "-m", "http.server", "8101"]
     assert captured["extra_env"]["SHARDON_GPU_GROUP_ID"] == "group-b"
+
+
+def test_backend_registry_appends_model_runtime_launch_args(tmp_path: Path) -> None:
+    config = _config()
+    config.models["model-a"].runtime_launch_args = ["--enable-prefix-caching"]
+    config.models["model-a"].runtime_launch_args_by_backend_type = {
+        "vllm": [
+            "--tool-call-parser",
+            "qwen3_coder",
+            '--speculative-config={"method":"mtp","num_speculative_tokens":3}',
+        ]
+    }
+    registry = BackendRegistry(config, tmp_path, EventLogger(tmp_path))
+    captured: dict[str, object] = {}
+
+    def fake_start(*, backend, deployment, extra_env=None):  # type: ignore[no-untyped-def]
+        captured["launch_command"] = backend.launch_command
+        captured["extra_env"] = extra_env or {}
+        return ManagedProcess(
+            deployment_id=deployment.id,
+            pid=4343,
+            command=backend.launch_command,
+            log_path=tmp_path / "dep-a.log",
+            started_at="2026-04-22T00:00:00+00:00",
+        )
+
+    registry.supervisor.start = fake_start  # type: ignore[method-assign]
+    pid = registry.ensure_started(config.deployments["dep-a"], gpu_group_id="group-a")
+    assert pid == 4343
+    assert captured["launch_command"] == [
+        "python3",
+        "-m",
+        "http.server",
+        "8100",
+        "--enable-prefix-caching",
+        "--tool-call-parser",
+        "qwen3_coder",
+        '--speculative-config={"method":"mtp","num_speculative_tokens":3}',
+    ]
+    assert (
+        captured["extra_env"]["SHARDON_MODEL_RUNTIME_LAUNCH_ARGS"]
+        == '--enable-prefix-caching --tool-call-parser qwen3_coder --speculative-config={"method":"mtp","num_speculative_tokens":3}'
+    )

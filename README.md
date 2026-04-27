@@ -12,6 +12,7 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - Backend abstraction for vLLM, SGLang, and independently runnable runtime folders.
 - Deployments can declare an ordered list of eligible GPU groups, with runtime GPU-group selection at load/start time.
 - Models, deployments, and backends can declare modality capabilities (`text`, `audio`, `image`, `video`) surfaced in `/v1/models` and runtime status.
+- Models can declare per-model runtime launch flags (global and backend-type scoped) that are appended when Shardon starts the backend process.
 - OpenAI-compatible endpoints for `models`, `chat/completions`, `completions`, `embeddings`, `audio/speech`, `audio/transcriptions`, `audio/translations`, and `batches`.
 - Admin UI for configuration, status, drains, keys, requests, jobs, and events.
 - Demo mock runtimes for local development without GPUs.

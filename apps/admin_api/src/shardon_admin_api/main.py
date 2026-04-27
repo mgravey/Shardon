@@ -369,6 +369,8 @@ def create_app() -> FastAPI:
             backend_compatibility=backend_compatibility,
             tasks=payload.tasks,
             model_capabilities=payload.model_capabilities,
+            runtime_launch_args=payload.runtime_launch_args,
+            runtime_launch_args_by_backend_type=payload.runtime_launch_args_by_backend_type,
             tokenizer=payload.tokenizer,
             metadata=payload.metadata,
         ).model_dump(mode="json")

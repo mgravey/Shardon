@@ -14,3 +14,4 @@
 - Added `python-multipart` to `shardon-router-api` package dependencies so multipart audio routes start cleanly after standard bootstrap.
 - Added regression checks to ensure router multipart dependency is declared and bootstrap keeps syncing all workspace packages.
 - Interactive routing now rejects `no compatible deployment` requests immediately (HTTP 404) and does not queue unsupported/unconfigured models.
+- Added per-model runtime launch flags (`runtime_launch_args` and `runtime_launch_args_by_backend_type`) so model-specific backend CLI flags can be appended automatically at startup.

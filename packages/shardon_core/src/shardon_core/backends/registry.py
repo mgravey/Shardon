@@ -41,8 +41,16 @@ class BackendRegistry:
     def ensure_started(self, deployment: DeploymentConfig, *, gpu_group_id: str) -> int:
         backend = self.resolve_backend(deployment.backend_runtime_id, gpu_group_id=gpu_group_id)
         model = self.config.models.get(deployment.model_id)
+        runtime_launch_args: list[str] = []
+        if model is not None:
+            runtime_launch_args.extend(model.runtime_launch_args)
+            runtime_launch_args.extend(
+                model.runtime_launch_args_by_backend_type.get(backend.backend_type, [])
+            )
+        launch_command = [*backend.launch_command, *runtime_launch_args]
+        backend_to_start = backend.model_copy(update={"launch_command": launch_command})
         managed = self.supervisor.start(
-            backend=backend,
+            backend=backend_to_start,
             deployment=deployment,
             extra_env={
                 "SHARDON_DEPLOYMENT_ID": deployment.id,
@@ -51,6 +59,7 @@ class BackendRegistry:
                 "SHARDON_MODEL_DISPLAY_NAME": model.display_name if model is not None else deployment.display_name,
                 "SHARDON_API_MODEL_NAME": deployment.api_model_name,
                 "SHARDON_GPU_GROUP_ID": gpu_group_id,
+                "SHARDON_MODEL_RUNTIME_LAUNCH_ARGS": " ".join(runtime_launch_args),
             },
         )
         self.event_logger.emit(

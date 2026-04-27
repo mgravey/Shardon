@@ -105,6 +105,8 @@ class ModelOnboardingRequest(BaseModel):
     model_capabilities: list[Literal["text", "audio", "image", "video"]] = Field(
         default_factory=lambda: ["text"]
     )
+    runtime_launch_args: list[str] = Field(default_factory=list)
+    runtime_launch_args_by_backend_type: dict[str, list[str]] = Field(default_factory=dict)
     tokenizer: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     create_deployment: bool = True

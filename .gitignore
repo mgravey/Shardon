@@ -139,6 +139,8 @@ state/**/*.pid
 state/**/*.sock
 state/audio/
 config/router.local.yaml
+config/models-available/*.local.yaml
+config/models-enabled/*.local.yaml
 env/
 venv/
 ENV/
