@@ -17,6 +17,7 @@ environment:
   SHARDON_BACKEND_FLAVOR: vllm
 capabilities:
   chat: true
+  responses: true
   completions: true
   embeddings: false
   batch: true
@@ -25,4 +26,3 @@ capabilities:
   extra:
     tensor_parallel: true
     streaming: false
-

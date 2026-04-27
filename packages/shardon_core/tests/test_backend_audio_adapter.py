@@ -76,6 +76,36 @@ def test_audio_speech_returns_binary_payload(monkeypatch) -> None:
     assert payload.content_type == "audio/wav"
 
 
+def test_response_create_posts_to_responses_endpoint(monkeypatch) -> None:
+    def response_factory(url: str, *, json=None, data=None, files=None) -> httpx.Response:  # type: ignore[no-untyped-def]
+        assert url.endswith("/v1/responses")
+        assert json == {"model": "chat-model", "input": "hello", "instructions": "short"}
+        assert data is None
+        assert files is None
+        return httpx.Response(
+            200,
+            json={"id": "resp-1", "object": "response", "model": "chat-model"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(
+        "shardon_core.backends.base.httpx.AsyncClient",
+        _make_async_client_stub(response_factory),
+    )
+    adapter = OpenAIHTTPBackendAdapter(_make_backend())
+    result = asyncio.run(
+        adapter.invoke_response(
+            {
+                "model": "chat-model",
+                "input": "hello",
+                "instructions": "short",
+                "store": None,
+            }
+        )
+    )
+    assert result["id"] == "resp-1"
+
+
 def test_audio_transcription_uses_multipart_form(monkeypatch) -> None:
     seen: dict[str, object] = {}
 

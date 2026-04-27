@@ -17,6 +17,7 @@ from shardon_core.api.schemas import (
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ResponseCreateRequest,
 )
 from shardon_core.auth.service import AuthResult
 from shardon_core.backends.base import UploadedFilePayload
@@ -106,6 +107,17 @@ def create_app() -> FastAPI:
     ) -> Any:
         try:
             return await runtime.route_chat(payload, auth)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/v1/responses")
+    async def responses(
+        payload: ResponseCreateRequest,
+        auth: AuthResult = Depends(api_key_auth),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> Any:
+        try:
+            return await runtime.route_response(payload, auth)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

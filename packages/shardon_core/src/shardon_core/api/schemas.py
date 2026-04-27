@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AdminLoginRequest(BaseModel):
@@ -51,6 +51,13 @@ class ChatCompletionRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResponseCreateRequest(BaseModel):
+    model: str
+    input: Any | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
 class CompletionRequest(BaseModel):
     model: str
     prompt: str | list[str]
@@ -95,6 +102,7 @@ class ModelOnboardingRequest(BaseModel):
     tasks: list[
         Literal[
             "chat",
+            "response",
             "completion",
             "embedding",
             "audio_speech",

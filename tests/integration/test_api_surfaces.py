@@ -180,6 +180,50 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     assert chat_without_auth.status_code == 401
 
 
+def test_router_responses_route_forwards_json_payload(tmp_path: Path, monkeypatch) -> None:
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id="responses-key",
+        user_name="responses-user",
+        priority=100,
+        permissions=["inference"],
+        actor="admin",
+    )
+    app = create_router_app()
+    runtime = app.state.runtime
+    client = TestClient(app)
+
+    async def fake_response(payload, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "demo-chat"
+        assert payload.input == "ping"
+        dumped = payload.model_dump(mode="json")
+        assert dumped["instructions"] == "be concise"
+        return {"id": "resp-test", "object": "response", "model": payload.model}
+
+    runtime.route_response = fake_response  # type: ignore[method-assign]
+
+    unauthorized = client.post(
+        "/v1/responses",
+        json={"model": "demo-chat", "input": "ping"},
+    )
+    _assert_no_missing_query_dependencies(unauthorized, {"auth", "runtime"})
+    assert unauthorized.status_code == 401
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {secret}"},
+        json={"model": "demo-chat", "input": "ping", "instructions": "be concise"},
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp-test"
+
+
 def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> None:
     repo_root = _make_repo_copy(tmp_path)
     monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
@@ -207,6 +251,8 @@ def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> Non
     _assert_dep_param(_route(router_app, "/v1/models", "GET"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "auth")
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "runtime")
+    _assert_dep_param(_route(router_app, "/v1/responses", "POST"), "auth")
+    _assert_dep_param(_route(router_app, "/v1/responses", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "auth")
     _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/audio/transcriptions", "POST"), "auth")

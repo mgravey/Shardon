@@ -196,4 +196,5 @@ cython_debug/
 
 .env
 state/**/*.trace
+state/**/*responses-debug*.json
 bootstrap.log

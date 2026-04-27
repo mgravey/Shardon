@@ -192,6 +192,7 @@ class SchedulerEngine:
                 return False
         capability_map = {
             "chat": backend.capabilities.chat,
+            "response": backend.capabilities.responses,
             "completion": backend.capabilities.completions,
             "embedding": backend.capabilities.embeddings,
             "audio_speech": backend.capabilities.audio_speech,

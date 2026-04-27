@@ -6,6 +6,7 @@ backend_compatibility:
   - sglang
 tasks:
   - chat
+  - response
   - completion
 model_capabilities:
   - text
