@@ -17,6 +17,7 @@ environment:
   SHARDON_BACKEND_FLAVOR: vllm
 capabilities:
   chat: true
+  responses: true
   completions: true
   embeddings: false
   batch: true
@@ -24,4 +25,3 @@ capabilities:
   max_context_length: 16384
   extra:
     speculative_decode: true
-

@@ -13,6 +13,9 @@ class _DummyBackendAdapter(BackendAdapter):
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
+    async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
+
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 

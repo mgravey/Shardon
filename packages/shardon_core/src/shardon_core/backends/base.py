@@ -211,6 +211,10 @@ class BackendAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -315,6 +319,9 @@ class OpenAIHTTPBackendAdapter(BackendAdapter):
 
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/chat/completions", payload)
+
+    async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._post_json("/v1/responses", payload)
 
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/completions", payload)

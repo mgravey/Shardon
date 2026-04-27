@@ -37,6 +37,7 @@ class GlobalConfig(BaseModel):
 class BackendCapabilities(BaseModel):
     modalities: list[Literal["text", "audio", "image", "video"]] = Field(default_factory=lambda: ["text"])
     chat: bool = True
+    responses: bool = True
     completions: bool = True
     embeddings: bool = False
     audio_speech: bool = False
@@ -140,6 +141,7 @@ class ModelConfig(BaseModel):
     tasks: list[
         Literal[
             "chat",
+            "response",
             "completion",
             "embedding",
             "audio_speech",
@@ -191,6 +193,7 @@ class DeploymentConfig(BaseModel):
     tasks: list[
         Literal[
             "chat",
+            "response",
             "completion",
             "embedding",
             "audio_speech",

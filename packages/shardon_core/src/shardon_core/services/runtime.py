@@ -15,6 +15,7 @@ from shardon_core.api.schemas import (
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ResponseCreateRequest,
 )
 from shardon_core.auth.service import APIKeyService, AdminAuthService, AuthResult
 from shardon_core.backends.base import (
@@ -569,6 +570,19 @@ class ShardonRuntime:
             required_capability="text",
         )
 
+    async def route_response(
+        self,
+        request: ResponseCreateRequest,
+        auth: AuthResult,
+    ) -> dict[str, Any]:
+        return await self._route_interactive(
+            "response",
+            request.model,
+            request.model_dump(mode="json"),
+            auth,
+            required_capability="text",
+        )
+
     async def route_embedding(
         self,
         request: EmbeddingRequest,
@@ -857,6 +871,8 @@ class ShardonRuntime:
         try:
             if task == "chat":
                 result = await adapter.invoke_chat(payload)
+            elif task == "response":
+                result = await adapter.invoke_response(payload)
             elif task == "completion":
                 result = await adapter.invoke_completion(payload)
             elif task == "embedding":

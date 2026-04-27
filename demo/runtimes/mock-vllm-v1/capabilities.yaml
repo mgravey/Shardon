@@ -1,6 +1,6 @@
 chat: true
+responses: true
 completions: true
 embeddings: false
 batch: true
 openai_compatible: true
-

@@ -9,5 +9,5 @@ enabled: true
 priority_weight: 120
 tasks:
   - chat
+  - response
   - completion
-

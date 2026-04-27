@@ -41,6 +41,27 @@ def create_app(runtime_label: str) -> FastAPI:
             ],
         }
 
+    @app.post("/v1/responses")
+    async def response(payload: dict[str, object]) -> dict[str, object]:
+        prompt = str(payload.get("input", ""))
+        return {
+            "id": f"resp-{int(time.time())}",
+            "object": "response",
+            "model": payload.get("model", os.environ.get("SHARDON_API_MODEL_NAME", "demo-chat")),
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"[{runtime_label}] Shardon demo response: {prompt[:120]}",
+                        }
+                    ],
+                }
+            ],
+        }
+
     @app.post("/v1/completions")
     async def completion(payload: dict[str, object]) -> dict[str, object]:
         prompt = payload.get("prompt", "")
@@ -77,4 +98,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

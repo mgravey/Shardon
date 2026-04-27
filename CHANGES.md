@@ -1,5 +1,11 @@
 # Changes
 
+## 2026-04-27
+
+- Added router support for `POST /v1/responses` and forwards Responses API create payloads to OpenAI-compatible backends.
+- Added the `response` scheduler task and backend capability flag so deployments can explicitly opt into the Responses API surface.
+- Updated demo chat model/deployments and mock vLLM backends to advertise Responses API support.
+
 ## 2026-04-22
 
 - Added multimodal routing scaffolding across scheduler, runtime, backend adapters, and status output.
