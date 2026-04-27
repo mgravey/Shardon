@@ -174,7 +174,10 @@ class SchedulerEngine:
         deployment: DeploymentConfig,
         request: SchedulingRequest,
     ) -> bool:
-        if request.task not in deployment.tasks:
+        deployment_tasks = set(deployment.tasks)
+        if request.task == "response" and "chat" in deployment_tasks:
+            deployment_tasks.add("response")
+        if request.task not in deployment_tasks:
             return False
         model = self.config.models.get(deployment.model_id)
         backend = self.config.backends.get(deployment.backend_runtime_id)

@@ -117,6 +117,18 @@ def test_scheduler_prefers_loaded_compatible_deployment() -> None:
     assert decision.should_load is False
 
 
+def test_scheduler_routes_responses_to_chat_deployments_when_backend_supports_responses() -> None:
+    scheduler = SchedulerEngine(_config())
+    decision = scheduler.schedule(
+        SchedulingRequest("alpha", "response", 100, "interactive", "req-response"),
+        RuntimeStateSnapshot(),
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-a"
+    assert decision.should_load is True
+
+
 def test_scheduler_holds_switch_during_grace_window() -> None:
     scheduler = SchedulerEngine(_config())
     created_at = (datetime.now(tz=UTC) - timedelta(seconds=30)).isoformat()

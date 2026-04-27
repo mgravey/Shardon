@@ -1438,12 +1438,17 @@ class ShardonRuntime:
         required_capability: Literal["text", "audio", "image", "video"] | None = None,
         snapshot: RuntimeStateSnapshot,
     ) -> dict[str, Any]:
+        def supports_task(deployment: DeploymentConfig) -> bool:
+            if task in deployment.tasks:
+                return True
+            return task == "response" and "chat" in deployment.tasks
+
         candidates = [
             deployment
             for deployment in self.config.deployments.values()
             if deployment.enabled
             and deployment.api_model_name == model_name
-            and task in deployment.tasks
+            and supports_task(deployment)
             and (
                 required_capability is None
                 or required_capability in self._deployment_effective_capabilities(deployment)
