@@ -1,14 +1,12 @@
 import inspect
-import os
 import shutil
 from pathlib import Path
 
 from fastapi.params import Depends as DependsParam
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-
-from shardon_core.backends.base import BackendBinaryResponse
 from shardon_core.auth.service import APIKeyService
+from shardon_core.backends.base import BackendBinaryResponse
 from shardon_core.logging.events import EventLogger
 
 
@@ -44,7 +42,11 @@ def _assert_no_missing_query_dependencies(response, names: set[str]) -> None:
 
 def _route(app, path: str, method: str) -> APIRoute:
     for candidate in app.routes:
-        if isinstance(candidate, APIRoute) and candidate.path == path and method in candidate.methods:
+        if (
+            isinstance(candidate, APIRoute)
+            and candidate.path == path
+            and method in candidate.methods
+        ):
             return candidate
     raise AssertionError(f"route {method} {path} not found")
 
@@ -170,7 +172,10 @@ def test_admin_and_router_health_and_models(tmp_path: Path, monkeypatch) -> None
     payload = models.json()
     assert payload["object"] == "list"
     assert any(item["id"] == "demo-chat" for item in payload["data"])
-    assert any(item["id"] == "demo-chat" and item["model_capabilities"] == ["text"] for item in payload["data"])
+    assert any(
+        item["id"] == "demo-chat" and item["model_capabilities"] == ["text"]
+        for item in payload["data"]
+    )
 
     chat_without_auth = router_client.post(
         "/v1/chat/completions",
@@ -222,6 +227,49 @@ def test_router_responses_route_forwards_json_payload(tmp_path: Path, monkeypatc
     )
     assert response.status_code == 200
     assert response.json()["id"] == "resp-test"
+
+
+def test_router_responses_route_streams_backend_events(tmp_path: Path, monkeypatch) -> None:
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id="responses-stream-key",
+        user_name="responses-stream-user",
+        priority=100,
+        permissions=["inference"],
+        actor="admin",
+    )
+    app = create_router_app()
+    runtime = app.state.runtime
+    client = TestClient(app)
+
+    async def fake_stream_response(payload, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "demo-chat"
+        assert payload.input == "ping"
+        assert payload.model_dump(mode="json")["stream"] is True
+        yield b'data: {"type":"response.output_text.delta","delta":"hel"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    runtime.stream_response = fake_stream_response  # type: ignore[method-assign]
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {secret}"},
+        json={"model": "demo-chat", "input": "ping", "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = b"".join(response.iter_bytes())
+
+    assert b'"delta":"hel"' in body
+    assert body.endswith(b"data: [DONE]\n\n")
 
 
 def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> None:

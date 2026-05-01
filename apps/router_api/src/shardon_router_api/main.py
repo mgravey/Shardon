@@ -3,13 +3,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
-
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import StreamingResponse
 from shardon_core.api.schemas import (
     AudioMultipartRequest,
     AudioSpeechRequest,
@@ -87,6 +98,20 @@ def create_app() -> FastAPI:
         media_type = "text/vtt" if payload.response_format == "vtt" else "text/plain"
         return Response(content=text, media_type=media_type)
 
+    async def _prefetched_stream(iterator: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        try:
+            first_chunk = await anext(iterator)
+        except StopAsyncIteration:
+            first_chunk = b""
+
+        async def stream() -> AsyncIterator[bytes]:
+            if first_chunk:
+                yield first_chunk
+            async for chunk in iterator:
+                yield chunk
+
+        return stream()
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "router"}
@@ -117,6 +142,9 @@ def create_app() -> FastAPI:
         runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         try:
+            if payload.model_dump(mode="json").get("stream") is True:
+                stream = await _prefetched_stream(runtime.stream_response(payload, auth))
+                return StreamingResponse(stream, media_type="text/event-stream")
             return await runtime.route_response(payload, auth)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

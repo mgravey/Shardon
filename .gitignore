@@ -135,9 +135,13 @@ celerybeat.pid
 /.venv-work/
 state/**/*.bak*
 state/**/*.tmp
+state/**/*.json
+state/**/*.jsonl
 state/logs/*.tmp
 state/**/*.pid
 state/**/*.sock
+state/**/*.lock
+state/auth/*_secret
 state/audio/
 config/router.local.yaml
 config/models-available/*.local.yaml
@@ -197,4 +201,5 @@ cython_debug/
 .env
 state/**/*.trace
 state/**/*responses-debug*.json
+state/**/*.sse
 bootstrap.log

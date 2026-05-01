@@ -3,6 +3,7 @@
 ## 2026-04-27
 
 - Added router support for `POST /v1/responses` and forwards Responses API create payloads to OpenAI-compatible backends.
+- Added streaming passthrough for `POST /v1/responses` requests with `stream: true`, returning backend SSE bytes as `text/event-stream`.
 - Added the `response` scheduler task and backend capability flag so deployments can explicitly opt into the Responses API surface.
 - Updated demo chat model/deployments and mock vLLM backends to advertise Responses API support.
 
