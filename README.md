@@ -110,6 +110,12 @@ Runtime timeout defaults:
 - `backend_startup_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `queue_poll_interval_seconds` controls how often queued interactive requests retry scheduling decisions while waiting for eviction/startup readiness.
 
+Live router smoke test:
+
+- `SHARDON_API_KEY=<key> .venv/bin/python scripts/smoke_openai_surfaces.py`
+- The script checks `/v1/completions`, streaming `/v1/completions`, `/v1/responses`, streaming `/v1/responses`, and a routing/switching pass. Use `--switch-model <model>` when the running config has a second text model to force a cross-model switch.
+- Streaming checks expect the selected backend to support raw OpenAI-compatible SSE streaming.
+
 ## Multi-Group Deployments
 
 - `deployments` can use `gpu_group_ids` as an ordered preference list; `gpu_group_id` remains supported for backward compatibility.
