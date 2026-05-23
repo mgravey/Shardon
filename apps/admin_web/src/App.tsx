@@ -408,6 +408,45 @@ export default function App() {
       ),
     ),
   ).filter(Boolean);
+  const runtimeDeploymentRows = Array.from(
+    new Set([...Object.keys(resources?.deployments ?? {}), ...Object.keys(runtime?.deployments ?? {})]),
+  )
+    .map((deploymentId) => {
+      const deployment = (resources?.deployments[deploymentId] ?? {}) as {
+        api_model_name?: string;
+        backend_runtime_id?: string;
+        display_name?: string;
+        gpu_group_id?: string;
+        model_id?: string;
+      };
+      const runtimeState = (runtime?.deployments[deploymentId] ?? {}) as {
+        backend_runtime_id?: string;
+        current_model_name?: string;
+        desired_state?: string;
+        gpu_group_id?: string;
+        last_error?: string;
+        loaded?: boolean;
+        selected_gpu_group_id?: string;
+        state?: string;
+      };
+      const state = String(runtimeState.state ?? "unloaded");
+      return {
+        deploymentId,
+        displayName: String(deployment.display_name ?? deploymentId),
+        modelId: String(deployment.model_id ?? "unknown"),
+        apiModelName: String(deployment.api_model_name ?? "unknown"),
+        currentModelName: String(runtimeState.current_model_name ?? deployment.api_model_name ?? "none"),
+        backendRuntimeId: String(runtimeState.backend_runtime_id ?? deployment.backend_runtime_id ?? "unknown"),
+        gpuGroupId: String(
+          runtimeState.selected_gpu_group_id ?? runtimeState.gpu_group_id ?? deployment.gpu_group_id ?? "unknown",
+        ),
+        desiredState: String(runtimeState.desired_state ?? "unloaded"),
+        loaded: runtimeState.loaded === true,
+        state,
+        lastError: String(runtimeState.last_error ?? ""),
+      };
+    })
+    .sort((left, right) => Number(right.loaded) - Number(left.loaded) || left.deploymentId.localeCompare(right.deploymentId));
 
   return (
     <main className="shell">
@@ -835,6 +874,39 @@ export default function App() {
           <div className="panel-header">
             <h2>Queues and Runtime</h2>
             <p>Loaded deployments, group summaries, active requests, batch jobs, drains, and GPU observations.</p>
+          </div>
+          <div className="runtime-table">
+            <div className="runtime-table-head">
+              <span>Deployment</span>
+              <span>Current Model</span>
+              <span>Status</span>
+              <span>GPU Group</span>
+              <span>Backend</span>
+            </div>
+            {runtimeDeploymentRows.length > 0 ? (
+              runtimeDeploymentRows.map((row) => (
+                <div key={row.deploymentId} className={`runtime-row ${row.loaded ? "runtime-row-loaded" : ""}`}>
+                  <div>
+                    <strong>{row.displayName}</strong>
+                    <span>{row.deploymentId}</span>
+                    <span>model: {row.modelId}</span>
+                  </div>
+                  <div>
+                    <strong>{row.currentModelName}</strong>
+                    <span>alias: {row.apiModelName}</span>
+                  </div>
+                  <div>
+                    <span className={`status-pill status-${row.state}`}>{row.state}</span>
+                    <span>desired: {row.desiredState}</span>
+                    {row.lastError ? <span className="error-text">{row.lastError}</span> : null}
+                  </div>
+                  <span>{row.gpuGroupId}</span>
+                  <span>{row.backendRuntimeId}</span>
+                </div>
+              ))
+            ) : (
+              <div className="empty-state">No deployments found.</div>
+            )}
           </div>
           <pre>{JSON.stringify({ gpu_groups: runtime?.gpu_groups, backend_health: runtime?.backend_health }, null, 2)}</pre>
         </article>

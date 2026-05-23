@@ -10,7 +10,7 @@ from shardon_core.api.schemas import ChatCompletionRequest
 from shardon_core.auth.service import AuthResult
 from shardon_core.gpu.provider import MockGPUProvider
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
-from shardon_core.state.models import ActiveRequest, BatchJobState
+from shardon_core.state.models import ActiveRequest, BatchJobState, DeploymentRuntimeState
 
 
 def _source_repo_root() -> Path:
@@ -24,6 +24,15 @@ def _copy_repo_fixture(tmp_path: Path) -> Path:
     source_root = _source_repo_root()
     target_root = tmp_path / "repo"
     shutil.copytree(source_root / "config", target_root / "config")
+    router_config = target_root / "config" / "router.yaml"
+    router_config.write_text(
+        "\n".join(
+            "state_root: state" if line.startswith("state_root: ") else line
+            for line in router_config.read_text(encoding="utf-8").splitlines()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     for directory_name in ("admins-available", "admins-enabled"):
         admin_dir = target_root / "config" / "auth" / directory_name
         for admin_user in admin_dir.glob("*.yaml"):
@@ -136,3 +145,94 @@ def test_unsupported_model_rejected_immediately_without_queueing(tmp_path: Path)
     assert exc.value.detail["model_name"] == "missing-model"
     snapshot = runtime.snapshot()
     assert snapshot.queued_requests == []
+
+
+def _loaded_deployment_state(runtime: ShardonRuntime, deployment_id: str) -> DeploymentRuntimeState:
+    deployment = runtime.config.deployments[deployment_id]
+    gpu_group_id = deployment.preferred_gpu_group_id()
+    return DeploymentRuntimeState(
+        deployment_id=deployment.id,
+        gpu_group_id=gpu_group_id,
+        selected_gpu_group_id=gpu_group_id,
+        backend_runtime_id=deployment.backend_runtime_id,
+        loaded=True,
+        state="ready",
+        desired_state="loaded",
+        current_model_name=deployment.api_model_name,
+        loaded_at="2026-04-21T00:00:00+00:00",
+    )
+
+
+def _first_compatible_deployment(runtime: ShardonRuntime, task: str, capability: str):
+    for deployment in runtime.config.deployments.values():
+        if not deployment.enabled:
+            continue
+        if task not in deployment.tasks:
+            continue
+        if capability not in runtime._deployment_effective_capabilities(deployment):
+            continue
+        return deployment
+    raise AssertionError(f"no fixture deployment supports {task}/{capability}")
+
+
+def test_list_api_models_includes_currently_loaded_alias(tmp_path: Path) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+    deployment = _first_compatible_deployment(runtime, "chat", "text")
+    runtime.state_store.mutate(
+        lambda snapshot: snapshot.model_copy(
+            update={
+                "deployments": {
+                    deployment.id: _loaded_deployment_state(runtime, deployment.id),
+                },
+            }
+        )
+    )
+
+    models = {item["id"]: item for item in runtime.list_api_models()}
+
+    assert "currently-loaded" in models
+    assert models["currently-loaded"]["resolved_model_id"] == deployment.api_model_name
+    assert models["currently-loaded"]["current_model_name"] == deployment.api_model_name
+    assert models["currently-loaded"]["resolved_deployment_id"] == deployment.id
+
+
+def test_currently_loaded_alias_resolves_to_loaded_compatible_deployment(tmp_path: Path) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+    deployment = _first_compatible_deployment(runtime, "chat", "text")
+    runtime.state_store.mutate(
+        lambda snapshot: snapshot.model_copy(
+            update={
+                "deployments": {
+                    deployment.id: _loaded_deployment_state(runtime, deployment.id),
+                },
+            }
+        )
+    )
+
+    resolved = runtime._resolve_model_alias(
+        model_name="currently-loaded",
+        task="chat",
+        required_capability="text",
+        snapshot=runtime.snapshot(),
+    )
+
+    assert resolved == deployment.api_model_name
+
+
+def test_currently_loaded_alias_requires_compatible_loaded_deployment(tmp_path: Path) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+
+    with pytest.raises(RuntimeOperationError) as exc:
+        runtime._resolve_model_alias(
+            model_name="currently-loaded",
+            task="chat",
+            required_capability="text",
+            snapshot=runtime.snapshot(),
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail["error"] == "no currently loaded deployment"
+

@@ -49,6 +49,8 @@ class RuntimeOperationError(RuntimeError):
 
 
 class ShardonRuntime:
+    CURRENTLY_LOADED_MODEL_ALIAS = "currently-loaded"
+
     def __init__(
         self,
         *,
@@ -269,7 +271,95 @@ class ShardonRuntime:
                     "effective_capabilities": self._deployment_effective_capabilities(deployment),
                 },
             )
+        loaded = self._currently_loaded_deployments(snapshot=snapshot)
+        if loaded and self.CURRENTLY_LOADED_MODEL_ALIAS not in models:
+            deployment, runtime = loaded[0]
+            model = self.config.models[deployment.model_id]
+            backend = self.config.backends.get(deployment.backend_runtime_id)
+            selected_gpu_group_id = runtime.selected_gpu_group_id or runtime.gpu_group_id
+            models[self.CURRENTLY_LOADED_MODEL_ALIAS] = {
+                "id": self.CURRENTLY_LOADED_MODEL_ALIAS,
+                "object": "model",
+                "owned_by": "shardon",
+                "display_name": "Currently loaded",
+                "source_model_id": model.id,
+                "current_model_name": runtime.current_model_name or deployment.api_model_name,
+                "resolved_model_id": deployment.api_model_name,
+                "resolved_deployment_id": deployment.id,
+                "backend_runtime_id": deployment.backend_runtime_id,
+                "gpu_group_id": deployment.preferred_gpu_group_id(),
+                "gpu_group_ids": deployment.eligible_gpu_group_ids(),
+                "selected_gpu_group_id": selected_gpu_group_id,
+                "tasks": deployment.tasks,
+                "model_capabilities": model.model_capabilities,
+                "deployment_capabilities": deployment.deployment_capabilities,
+                "backend_modalities": backend.capabilities.modalities if backend is not None else [],
+                "effective_capabilities": self._deployment_effective_capabilities(deployment),
+            }
         return list(models.values())
+
+    @staticmethod
+    def _deployment_supports_task(deployment: DeploymentConfig, task: str) -> bool:
+        if task in deployment.tasks:
+            return True
+        return task == "response" and "chat" in deployment.tasks
+
+    def _currently_loaded_deployments(
+        self,
+        *,
+        snapshot: RuntimeStateSnapshot,
+        task: str | None = None,
+        required_capability: Literal["text", "audio", "image", "video"] | None = None,
+    ) -> list[tuple[DeploymentConfig, DeploymentRuntimeState]]:
+        loaded: list[tuple[DeploymentConfig, DeploymentRuntimeState]] = []
+        for deployment_id, runtime in snapshot.deployments.items():
+            if not runtime.loaded or runtime.state != "ready":
+                continue
+            deployment = self.config.deployments.get(deployment_id)
+            if deployment is None or not deployment.enabled:
+                continue
+            if task is not None and not self._deployment_supports_task(deployment, task):
+                continue
+            if (
+                required_capability is not None
+                and required_capability not in self._deployment_effective_capabilities(deployment)
+            ):
+                continue
+            loaded.append((deployment, runtime))
+        return sorted(
+            loaded,
+            key=lambda item: (item[1].last_used_at or item[1].loaded_at or "", item[0].id),
+            reverse=True,
+        )
+
+    def _resolve_model_alias(
+        self,
+        *,
+        model_name: str,
+        task: str,
+        required_capability: Literal["text", "audio", "image", "video"],
+        snapshot: RuntimeStateSnapshot,
+    ) -> str:
+        if model_name != self.CURRENTLY_LOADED_MODEL_ALIAS:
+            return model_name
+        loaded = self._currently_loaded_deployments(
+            snapshot=snapshot,
+            task=task,
+            required_capability=required_capability,
+        )
+        if not loaded:
+            raise RuntimeOperationError(
+                "no currently loaded deployment",
+                detail={
+                    "error": "no currently loaded deployment",
+                    "model_name": model_name,
+                    "task": task,
+                    "required_capability": required_capability,
+                },
+                status_code=404,
+            )
+        deployment, _ = loaded[0]
+        return deployment.api_model_name
 
     async def refresh_backend_health(self) -> RuntimeStateSnapshot:
         results: dict[str, dict[str, Any]] = {}
@@ -704,6 +794,15 @@ class ShardonRuntime:
         self.enforce_keep_free()
         request_id = f"req_{uuid.uuid4().hex}"
         preflight_snapshot = self.snapshot()
+        requested_model_name = model_name
+        model_name = self._resolve_model_alias(
+            model_name=model_name,
+            task=task,
+            required_capability=required_capability,
+            snapshot=preflight_snapshot,
+        )
+        if model_name != requested_model_name:
+            payload = {**payload, "model": model_name}
         preflight_decision = self.scheduler.schedule(
             SchedulingRequest(
                 model_name=model_name,
@@ -874,6 +973,15 @@ class ShardonRuntime:
         self.enforce_keep_free()
         request_id = f"req_{uuid.uuid4().hex}"
         preflight_snapshot = self.snapshot()
+        requested_model_name = model_name
+        model_name = self._resolve_model_alias(
+            model_name=model_name,
+            task=task,
+            required_capability=required_capability,
+            snapshot=preflight_snapshot,
+        )
+        if model_name != requested_model_name:
+            payload = {**payload, "model": model_name}
         preflight_decision = self.scheduler.schedule(
             SchedulingRequest(
                 model_name=model_name,
@@ -1768,17 +1876,12 @@ class ShardonRuntime:
         required_capability: Literal["text", "audio", "image", "video"] | None = None,
         snapshot: RuntimeStateSnapshot,
     ) -> dict[str, Any]:
-        def supports_task(deployment: DeploymentConfig) -> bool:
-            if task in deployment.tasks:
-                return True
-            return task == "response" and "chat" in deployment.tasks
-
         candidates = [
             deployment
             for deployment in self.config.deployments.values()
             if deployment.enabled
             and deployment.api_model_name == model_name
-            and supports_task(deployment)
+            and self._deployment_supports_task(deployment, task)
             and (
                 required_capability is None
                 or required_capability in self._deployment_effective_capabilities(deployment)
