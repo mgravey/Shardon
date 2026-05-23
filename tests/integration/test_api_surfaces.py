@@ -272,6 +272,51 @@ def test_router_responses_route_streams_backend_events(tmp_path: Path, monkeypat
     assert body.endswith(b"data: [DONE]\n\n")
 
 
+def test_router_completions_route_streams_backend_events(tmp_path: Path, monkeypatch) -> None:
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id="completions-stream-key",
+        user_name="completions-stream-user",
+        priority=100,
+        permissions=["inference"],
+        actor="admin",
+    )
+    app = create_router_app()
+    runtime = app.state.runtime
+    client = TestClient(app)
+
+    async def fake_stream_completion(payload, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        assert payload.model == "demo-chat"
+        assert payload.prompt == "ping"
+        dumped = payload.model_dump(mode="json")
+        assert dumped["stream"] is True
+        assert dumped["suffix"] == "pong"
+        yield b'data: {"choices":[{"text":"hel"}]}\n\n'
+        yield b'data: {"choices":[{"text":"lo"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    runtime.stream_completion = fake_stream_completion  # type: ignore[method-assign]
+
+    with client.stream(
+        "POST",
+        "/v1/completions",
+        headers={"Authorization": f"Bearer {secret}"},
+        json={"model": "demo-chat", "prompt": "ping", "stream": True, "suffix": "pong"},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = b"".join(response.iter_bytes())
+
+    assert b'"text":"hel"' in body
+    assert body.endswith(b"data: [DONE]\n\n")
+
+
 def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> None:
     repo_root = _make_repo_copy(tmp_path)
     monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
@@ -301,6 +346,8 @@ def test_route_signatures_use_direct_depends(tmp_path: Path, monkeypatch) -> Non
     _assert_dep_param(_route(router_app, "/v1/chat/completions", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/responses", "POST"), "auth")
     _assert_dep_param(_route(router_app, "/v1/responses", "POST"), "runtime")
+    _assert_dep_param(_route(router_app, "/v1/completions", "POST"), "auth")
+    _assert_dep_param(_route(router_app, "/v1/completions", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "auth")
     _assert_dep_param(_route(router_app, "/v1/audio/speech", "POST"), "runtime")
     _assert_dep_param(_route(router_app, "/v1/audio/transcriptions", "POST"), "auth")

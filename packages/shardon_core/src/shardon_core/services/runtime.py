@@ -570,6 +570,21 @@ class ShardonRuntime:
             required_capability="text",
         )
 
+    async def stream_completion(
+        self,
+        request: CompletionRequest,
+        auth: AuthResult,
+    ) -> AsyncIterator[bytes]:
+        payload = request.model_dump(mode="json")
+        async for chunk in self._route_interactive_stream(
+            "completion",
+            request.model,
+            payload,
+            auth,
+            required_capability="text",
+        ):
+            yield chunk
+
     async def route_response(
         self,
         request: ResponseCreateRequest,
@@ -1139,9 +1154,9 @@ class ShardonRuntime:
         target_gpu_group_id: str,
         should_evict: list[str],
     ) -> AsyncIterator[bytes]:
-        if task != "response":
+        if task not in {"response", "completion"}:
             raise RuntimeOperationError(
-                "streaming is only implemented for responses",
+                "streaming is only implemented for responses and completions",
                 detail={"error": "unsupported streaming task", "task": task},
                 status_code=409,
             )
@@ -1197,7 +1212,11 @@ class ShardonRuntime:
             gpu_group_id=target_gpu_group_id,
         )
         try:
-            async for chunk in adapter.stream_response(payload):
+            if task == "response":
+                stream = adapter.stream_response(payload)
+            else:
+                stream = adapter.stream_completion(payload)
+            async for chunk in stream:
                 yield chunk
             self.state_store.mutate(
                 lambda state: self._mark_request_finished(state, request_id, deployment.id)

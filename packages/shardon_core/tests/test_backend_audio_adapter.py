@@ -175,6 +175,41 @@ def test_response_stream_preserves_backend_sse_chunks(monkeypatch) -> None:
     assert body == b'data: {"delta":"hel"}\n\ndata: [DONE]\n\n'
 
 
+def test_completion_stream_preserves_backend_sse_chunks(monkeypatch) -> None:
+    def response_factory(method: str, url: str, *, json=None) -> httpx.Response:  # type: ignore[no-untyped-def]
+        assert method == "POST"
+        assert url.endswith("/v1/completions")
+        assert json == {"model": "completion-model", "prompt": "hello", "stream": True}
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"text":"hel"}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(
+        "shardon_core.backends.base.httpx.AsyncClient",
+        _make_streaming_client_stub(response_factory),
+    )
+    adapter = OpenAIHTTPBackendAdapter(_make_backend())
+
+    async def collect() -> bytes:
+        chunks = []
+        async for chunk in adapter.stream_completion(
+            {
+                "model": "completion-model",
+                "prompt": "hello",
+                "stream": True,
+                "temperature": None,
+            }
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(collect())
+    assert body == b'data: {"choices":[{"text":"hel"}]}\n\ndata: [DONE]\n\n'
+
+
 def test_audio_transcription_uses_multipart_form(monkeypatch) -> None:
     seen: dict[str, object] = {}
 

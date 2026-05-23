@@ -156,6 +156,9 @@ def create_app() -> FastAPI:
         runtime: ShardonRuntime = Depends(get_runtime),
     ) -> Any:
         try:
+            if payload.model_dump(mode="json").get("stream") is True:
+                stream = await _prefetched_stream(runtime.stream_completion(payload, auth))
+                return StreamingResponse(stream, media_type="text/event-stream")
             return await runtime.route_completion(payload, auth)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
