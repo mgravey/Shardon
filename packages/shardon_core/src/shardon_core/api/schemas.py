@@ -63,6 +63,9 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     max_tokens: int | None = None
     temperature: float | None = None
+    stream: bool | None = None
+
+    model_config = ConfigDict(extra="allow")
 
 
 class EmbeddingRequest(BaseModel):

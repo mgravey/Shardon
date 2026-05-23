@@ -4,7 +4,7 @@ import asyncio
 import getpass
 import os
 import uuid
-from datetime import datetime
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,7 +17,7 @@ from shardon_core.api.schemas import (
     EmbeddingRequest,
     ResponseCreateRequest,
 )
-from shardon_core.auth.service import APIKeyService, AdminAuthService, AuthResult
+from shardon_core.auth.service import AdminAuthService, APIKeyService, AuthResult
 from shardon_core.backends.base import (
     BackendBinaryResponse,
     BackendOperationError,
@@ -570,6 +570,21 @@ class ShardonRuntime:
             required_capability="text",
         )
 
+    async def stream_completion(
+        self,
+        request: CompletionRequest,
+        auth: AuthResult,
+    ) -> AsyncIterator[bytes]:
+        payload = request.model_dump(mode="json")
+        async for chunk in self._route_interactive_stream(
+            "completion",
+            request.model,
+            payload,
+            auth,
+            required_capability="text",
+        ):
+            yield chunk
+
     async def route_response(
         self,
         request: ResponseCreateRequest,
@@ -582,6 +597,21 @@ class ShardonRuntime:
             auth,
             required_capability="text",
         )
+
+    async def stream_response(
+        self,
+        request: ResponseCreateRequest,
+        auth: AuthResult,
+    ) -> AsyncIterator[bytes]:
+        payload = request.model_dump(mode="json")
+        async for chunk in self._route_interactive_stream(
+            "response",
+            request.model,
+            payload,
+            auth,
+            required_capability="text",
+        ):
+            yield chunk
 
     async def route_embedding(
         self,
@@ -700,7 +730,11 @@ class ShardonRuntime:
                     snapshot=preflight_snapshot,
                 ),
             }
-            raise RuntimeOperationError("no compatible deployment", detail=detail, status_code=404)
+            raise RuntimeOperationError(
+                "no compatible deployment",
+                detail=detail,
+                status_code=404,
+            )
         queued_request = ActiveRequest(
             id=request_id,
             user_name=auth.user_name,
@@ -715,7 +749,9 @@ class ShardonRuntime:
             created_at=utc_now_iso(),
         )
         self.state_store.mutate(lambda snapshot: self._enqueue_request(snapshot, queued_request))
-        interactive_timeout_seconds = self.config.global_config.effective_interactive_request_timeout_seconds()
+        interactive_timeout_seconds = (
+            self.config.global_config.effective_interactive_request_timeout_seconds()
+        )
         deadline = asyncio.get_event_loop().time() + interactive_timeout_seconds
         last_decision_reason = "no scheduling decision made yet"
         last_detail: dict[str, Any] = {}
@@ -758,7 +794,11 @@ class ShardonRuntime:
                     "last_decision_reason": decision.reason,
                     **last_detail,
                 }
-                raise RuntimeOperationError("no compatible deployment", detail=detail, status_code=404)
+                raise RuntimeOperationError(
+                    "no compatible deployment",
+                    detail=detail,
+                    status_code=404,
+                )
             if decision.accepted and decision.deployment_id is not None:
                 if any(
                     snapshot.deployments.get(deployment_id)
@@ -775,15 +815,188 @@ class ShardonRuntime:
                         payload=payload,
                         task=task,
                         auth=auth,
-                        target_gpu_group_id=decision.gpu_group_id or deployment.preferred_gpu_group_id(),
+                        target_gpu_group_id=(
+                            decision.gpu_group_id or deployment.preferred_gpu_group_id()
+                        ),
                         should_evict=decision.should_evict or [],
                         uploaded_file=uploaded_file,
                     )
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
                     return response
                 except RuntimeOperationError as exc:
+                    diagnostic = exc.detail
                     self.state_store.mutate(
-                        lambda state: self._mark_request_diagnostic(state, request_id, exc.detail)
+                        lambda state: self._mark_request_diagnostic(
+                            state,
+                            request_id,
+                            diagnostic,
+                        )
+                    )
+                    self.state_store.mutate(lambda state: self._drop_request(state, request_id))
+                    raise
+                except (asyncio.CancelledError, GeneratorExit):
+                    self.state_store.mutate(lambda state: self._drop_request(state, request_id))
+                    raise
+            await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
+            self.refresh_gpu_observations()
+            self.enforce_keep_free()
+        self.state_store.mutate(lambda state: self._drop_request(state, request_id))
+        detail = {
+            "error": "request timed out waiting for a deployment",
+            "model_name": model_name,
+            "task": task,
+            "timeout_seconds": interactive_timeout_seconds,
+            "last_decision_reason": last_decision_reason,
+            **last_detail,
+        }
+        self.event_logger.emit(
+            "routing.timeout",
+            "request timed out waiting for a deployment",
+            request_id=request_id,
+            **detail,
+        )
+        raise RuntimeOperationError(
+            "request timed out waiting for a deployment",
+            detail=detail,
+            status_code=409,
+        )
+
+    async def _route_interactive_stream(
+        self,
+        task: str,
+        model_name: str,
+        payload: dict[str, Any],
+        auth: AuthResult,
+        *,
+        required_capability: Literal["text", "audio", "image", "video"],
+    ) -> AsyncIterator[bytes]:
+        self.refresh_gpu_observations()
+        self.enforce_keep_free()
+        request_id = f"req_{uuid.uuid4().hex}"
+        preflight_snapshot = self.snapshot()
+        preflight_decision = self.scheduler.schedule(
+            SchedulingRequest(
+                model_name=model_name,
+                task=task,
+                priority=auth.priority,
+                request_class="interactive",
+                request_id=request_id,
+                required_capability=required_capability,
+            ),
+            preflight_snapshot,
+            utc_now(),
+        )
+        if not preflight_decision.accepted and preflight_decision.status_code == 404:
+            detail = {
+                "error": "no compatible deployment",
+                "model_name": model_name,
+                "task": task,
+                "required_capability": required_capability,
+                "last_decision_reason": preflight_decision.reason,
+                **self._build_candidate_status(
+                    model_name=model_name,
+                    task=task,
+                    required_capability=required_capability,
+                    snapshot=preflight_snapshot,
+                ),
+            }
+            raise RuntimeOperationError("no compatible deployment", detail=detail, status_code=404)
+        queued_request = ActiveRequest(
+            id=request_id,
+            user_name=auth.user_name,
+            api_key_id=auth.id,
+            deployment_id="",
+            backend_runtime_id="",
+            gpu_group_id="",
+            request_class="interactive",
+            model_name=model_name,
+            status="queued",
+            priority=auth.priority,
+            created_at=utc_now_iso(),
+        )
+        self.state_store.mutate(lambda snapshot: self._enqueue_request(snapshot, queued_request))
+        interactive_timeout_seconds = (
+            self.config.global_config.effective_interactive_request_timeout_seconds()
+        )
+        deadline = asyncio.get_event_loop().time() + interactive_timeout_seconds
+        last_decision_reason = "no scheduling decision made yet"
+        last_detail: dict[str, Any] = {}
+        while asyncio.get_event_loop().time() < deadline:
+            snapshot = self.snapshot()
+            if not any(item.id == request_id for item in snapshot.queued_requests):
+                detail = {
+                    "error": "request cancelled",
+                    "request_id": request_id,
+                    "model_name": model_name,
+                    "task": task,
+                }
+                raise RuntimeOperationError("request cancelled", detail=detail, status_code=409)
+            decision = self.scheduler.schedule(
+                SchedulingRequest(
+                    model_name=model_name,
+                    task=task,
+                    priority=auth.priority,
+                    request_class="interactive",
+                    request_id=request_id,
+                    required_capability=required_capability,
+                ),
+                snapshot,
+                utc_now(),
+            )
+            last_decision_reason = decision.reason
+            last_detail = self._build_candidate_status(
+                model_name=model_name,
+                task=task,
+                required_capability=required_capability,
+                snapshot=snapshot,
+            )
+            if not decision.accepted and decision.status_code == 404:
+                self.state_store.mutate(lambda state: self._drop_request(state, request_id))
+                detail = {
+                    "error": "no compatible deployment",
+                    "model_name": model_name,
+                    "task": task,
+                    "required_capability": required_capability,
+                    "last_decision_reason": decision.reason,
+                    **last_detail,
+                }
+                raise RuntimeOperationError(
+                    "no compatible deployment",
+                    detail=detail,
+                    status_code=404,
+                )
+            if decision.accepted and decision.deployment_id is not None:
+                if any(
+                    snapshot.deployments.get(deployment_id)
+                    and snapshot.deployments[deployment_id].active_request_ids
+                    for deployment_id in (decision.should_evict or [])
+                ):
+                    await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
+                    continue
+                deployment = self.config.deployments[decision.deployment_id]
+                try:
+                    async for chunk in self._execute_stream_request(
+                        deployment=deployment,
+                        request_id=request_id,
+                        payload=payload,
+                        task=task,
+                        auth=auth,
+                        target_gpu_group_id=(
+                            decision.gpu_group_id or deployment.preferred_gpu_group_id()
+                        ),
+                        should_evict=decision.should_evict or [],
+                    ):
+                        yield chunk
+                    self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
+                    return
+                except RuntimeOperationError as exc:
+                    diagnostic = exc.detail
+                    self.state_store.mutate(
+                        lambda state: self._mark_request_diagnostic(
+                            state,
+                            request_id,
+                            diagnostic,
+                        )
                     )
                     self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                     raise
@@ -805,7 +1018,11 @@ class ShardonRuntime:
             request_id=request_id,
             **detail,
         )
-        raise RuntimeOperationError("request timed out waiting for a deployment", detail=detail, status_code=409)
+        raise RuntimeOperationError(
+            "request timed out waiting for a deployment",
+            detail=detail,
+            status_code=409,
+        )
 
     async def _execute_request(
         self,
@@ -826,7 +1043,9 @@ class ShardonRuntime:
             if current is not None
             else None
         )
-        should_start = current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
+        should_start = (
+            current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
+        )
         planned_evictions = list(should_evict)
         if (
             current is not None
@@ -901,13 +1120,16 @@ class ShardonRuntime:
                     payload=payload,
                     uploaded_file=uploaded_file,
                 )
-            self.state_store.mutate(lambda state: self._mark_request_finished(state, request_id, deployment.id))
+            self.state_store.mutate(
+                lambda state: self._mark_request_finished(state, request_id, deployment.id)
+            )
             return result
         except RuntimeOperationError:
             raise
         except Exception as exc:
+            error = str(exc)
             self.state_store.mutate(
-                lambda state: self._mark_request_failed(state, request_id, deployment.id, str(exc))
+                lambda state: self._mark_request_failed(state, request_id, deployment.id, error)
             )
             raise RuntimeOperationError(
                 "backend request failed",
@@ -916,7 +1138,114 @@ class ShardonRuntime:
                     "deployment_id": deployment.id,
                     "backend_runtime_id": deployment.backend_runtime_id,
                     "gpu_group_id": target_gpu_group_id,
-                    "detail": str(exc),
+                    "detail": error,
+                },
+                status_code=409,
+            ) from exc
+
+    async def _execute_stream_request(
+        self,
+        *,
+        deployment: DeploymentConfig,
+        request_id: str,
+        payload: dict[str, Any],
+        task: str,
+        auth: AuthResult,
+        target_gpu_group_id: str,
+        should_evict: list[str],
+    ) -> AsyncIterator[bytes]:
+        if task not in {"response", "completion"}:
+            raise RuntimeOperationError(
+                "streaming is only implemented for responses and completions",
+                detail={"error": "unsupported streaming task", "task": task},
+                status_code=409,
+            )
+        snapshot = self.snapshot()
+        current = snapshot.deployments.get(deployment.id)
+        current_gpu_group_id = (
+            (current.selected_gpu_group_id or current.gpu_group_id)
+            if current is not None
+            else None
+        )
+        should_start = (
+            current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
+        )
+        planned_evictions = list(should_evict)
+        if (
+            current is not None
+            and current.loaded
+            and current_gpu_group_id is not None
+            and current_gpu_group_id != target_gpu_group_id
+        ):
+            if current.active_request_ids:
+                raise RuntimeOperationError(
+                    "deployment is busy and cannot switch gpu group",
+                    detail={
+                        "error": "deployment is busy and cannot switch gpu group",
+                        "deployment_id": deployment.id,
+                        "current_gpu_group_id": current_gpu_group_id,
+                        "target_gpu_group_id": target_gpu_group_id,
+                        "active_request_ids": current.active_request_ids,
+                    },
+                    status_code=409,
+                )
+            planned_evictions.append(deployment.id)
+        if should_start:
+            planned_evictions = list(dict.fromkeys(planned_evictions))
+            self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
+            await self._start_and_mark_ready(
+                deployment,
+                selected_gpu_group_id=target_gpu_group_id,
+                reason=f"routing request {request_id}",
+            )
+        self.state_store.mutate(
+            lambda state: self._mark_request_running(
+                state,
+                request_id,
+                deployment,
+                auth,
+                target_gpu_group_id,
+            )
+        )
+        adapter = self.backends.adapter_for(
+            deployment.backend_runtime_id,
+            gpu_group_id=target_gpu_group_id,
+        )
+        try:
+            if task == "response":
+                stream = adapter.stream_response(payload)
+            else:
+                stream = adapter.stream_completion(payload)
+            async for chunk in stream:
+                yield chunk
+            self.state_store.mutate(
+                lambda state: self._mark_request_finished(state, request_id, deployment.id)
+            )
+        except RuntimeOperationError:
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            self.state_store.mutate(
+                lambda state: self._mark_request_failed(
+                    state,
+                    request_id,
+                    deployment.id,
+                    "stream cancelled",
+                )
+            )
+            raise
+        except Exception as exc:
+            error = str(exc)
+            self.state_store.mutate(
+                lambda state: self._mark_request_failed(state, request_id, deployment.id, error)
+            )
+            raise RuntimeOperationError(
+                "backend streaming request failed",
+                detail={
+                    "error": "backend streaming request failed",
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": target_gpu_group_id,
+                    "detail": error,
                 },
                 status_code=409,
             ) from exc
@@ -1031,12 +1360,13 @@ class ShardonRuntime:
                 gpu_group_id=selected_gpu_group_id,
             )
         except BackendOperationError as exc:
+            readiness_detail = exc.detail
             self.state_store.mutate(
                 lambda state: self._mark_start_failed(
                     state,
                     deployment,
                     selected_gpu_group_id=selected_gpu_group_id,
-                    detail=exc.detail,
+                    detail=readiness_detail,
                     reason=reason,
                 )
             )
@@ -1048,7 +1378,7 @@ class ShardonRuntime:
                     "gpu_group_id": selected_gpu_group_id,
                     "backend_runtime_id": deployment.backend_runtime_id,
                     "reason": reason,
-                    "readiness": exc.detail,
+                    "readiness": readiness_detail,
                 },
                 status_code=409,
             ) from exc
@@ -1438,12 +1768,17 @@ class ShardonRuntime:
         required_capability: Literal["text", "audio", "image", "video"] | None = None,
         snapshot: RuntimeStateSnapshot,
     ) -> dict[str, Any]:
+        def supports_task(deployment: DeploymentConfig) -> bool:
+            if task in deployment.tasks:
+                return True
+            return task == "response" and "chat" in deployment.tasks
+
         candidates = [
             deployment
             for deployment in self.config.deployments.values()
             if deployment.enabled
             and deployment.api_model_name == model_name
-            and task in deployment.tasks
+            and supports_task(deployment)
             and (
                 required_capability is None
                 or required_capability in self._deployment_effective_capabilities(deployment)

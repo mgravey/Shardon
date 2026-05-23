@@ -3,8 +3,11 @@ from collections.abc import Callable
 from typing import Literal
 
 import httpx
-
-from shardon_core.backends.base import OpenAIHTTPBackendAdapter, UploadedFilePayload, WhisperXBackendAdapter
+from shardon_core.backends.base import (
+    OpenAIHTTPBackendAdapter,
+    UploadedFilePayload,
+    WhisperXBackendAdapter,
+)
 from shardon_core.config.schemas import BackendRuntimeConfig
 
 
@@ -53,6 +56,38 @@ def _make_async_client_stub(
     return _StubAsyncClient
 
 
+def _make_streaming_client_stub(response_factory: Callable[..., httpx.Response]) -> type:
+    class _StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type
+            _ = exc
+            _ = tb
+
+    class _StubAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args
+            _ = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type
+            _ = exc
+            _ = tb
+
+        def stream(self, method: str, url: str, json=None) -> _StreamContext:  # type: ignore[no-untyped-def]
+            return _StreamContext(response_factory(method, url, json=json))
+
+    return _StubAsyncClient
+
+
 def test_audio_speech_returns_binary_payload(monkeypatch) -> None:
     def response_factory(url: str, *, json=None, data=None, files=None) -> httpx.Response:  # type: ignore[no-untyped-def]
         assert url.endswith("/v1/audio/speech")
@@ -71,7 +106,11 @@ def test_audio_speech_returns_binary_payload(monkeypatch) -> None:
         _make_async_client_stub(response_factory),
     )
     adapter = OpenAIHTTPBackendAdapter(_make_backend())
-    payload = asyncio.run(adapter.invoke_audio_speech({"model": "audio-model", "input": "hello", "voice": "alloy"}))
+    payload = asyncio.run(
+        adapter.invoke_audio_speech(
+            {"model": "audio-model", "input": "hello", "voice": "alloy"}
+        )
+    )
     assert payload.body == b"wave-bytes"
     assert payload.content_type == "audio/wav"
 
@@ -104,6 +143,71 @@ def test_response_create_posts_to_responses_endpoint(monkeypatch) -> None:
         )
     )
     assert result["id"] == "resp-1"
+
+
+def test_response_stream_preserves_backend_sse_chunks(monkeypatch) -> None:
+    def response_factory(method: str, url: str, *, json=None) -> httpx.Response:  # type: ignore[no-untyped-def]
+        assert method == "POST"
+        assert url.endswith("/v1/responses")
+        assert json == {"model": "chat-model", "input": "hello", "stream": True}
+        return httpx.Response(
+            200,
+            content=b'data: {"delta":"hel"}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(
+        "shardon_core.backends.base.httpx.AsyncClient",
+        _make_streaming_client_stub(response_factory),
+    )
+    adapter = OpenAIHTTPBackendAdapter(_make_backend())
+
+    async def collect() -> bytes:
+        chunks = []
+        async for chunk in adapter.stream_response(
+            {"model": "chat-model", "input": "hello", "stream": True, "store": None}
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(collect())
+    assert body == b'data: {"delta":"hel"}\n\ndata: [DONE]\n\n'
+
+
+def test_completion_stream_preserves_backend_sse_chunks(monkeypatch) -> None:
+    def response_factory(method: str, url: str, *, json=None) -> httpx.Response:  # type: ignore[no-untyped-def]
+        assert method == "POST"
+        assert url.endswith("/v1/completions")
+        assert json == {"model": "completion-model", "prompt": "hello", "stream": True}
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"text":"hel"}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(
+        "shardon_core.backends.base.httpx.AsyncClient",
+        _make_streaming_client_stub(response_factory),
+    )
+    adapter = OpenAIHTTPBackendAdapter(_make_backend())
+
+    async def collect() -> bytes:
+        chunks = []
+        async for chunk in adapter.stream_completion(
+            {
+                "model": "completion-model",
+                "prompt": "hello",
+                "stream": True,
+                "temperature": None,
+            }
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(collect())
+    assert body == b'data: {"choices":[{"text":"hel"}]}\n\ndata: [DONE]\n\n'
 
 
 def test_audio_transcription_uses_multipart_form(monkeypatch) -> None:

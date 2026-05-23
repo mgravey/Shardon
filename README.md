@@ -14,6 +14,7 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - Models, deployments, and backends can declare modality capabilities (`text`, `audio`, `image`, `video`) surfaced in `/v1/models` and runtime status.
 - Models can declare per-model runtime launch flags (global and backend-type scoped) that are appended when Shardon starts the backend process.
 - OpenAI-compatible endpoints for `models`, `responses`, `chat/completions`, `completions`, `embeddings`, `audio/speech`, `audio/transcriptions`, `audio/translations`, and `batches`.
+- Streaming `POST /v1/responses` and `POST /v1/completions` requests (`stream: true`) are proxied as `text/event-stream` when the selected backend supports streaming.
 - Admin UI for configuration, status, drains, keys, requests, jobs, and events.
 - Demo mock runtimes for local development without GPUs.
 - Route-level FastAPI dependencies declared directly with `= Depends(...)` for compatibility across FastAPI/Pydantic versions.
@@ -108,6 +109,12 @@ Runtime timeout defaults:
 - `interactive_request_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `backend_startup_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `queue_poll_interval_seconds` controls how often queued interactive requests retry scheduling decisions while waiting for eviction/startup readiness.
+
+Live router smoke test:
+
+- `SHARDON_API_KEY=<key> .venv/bin/python scripts/smoke_openai_surfaces.py`
+- The script checks `/v1/completions`, streaming `/v1/completions`, `/v1/responses`, streaming `/v1/responses`, and a routing/switching pass. Use `--switch-model <model>` when the running config has a second text model to force a cross-model switch.
+- Streaming checks expect the selected backend to support raw OpenAI-compatible SSE streaming.
 
 ## Multi-Group Deployments
 

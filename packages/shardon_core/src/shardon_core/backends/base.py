@@ -6,6 +6,7 @@ import signal
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -214,9 +215,23 @@ class BackendAdapter(ABC):
     async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def stream_response(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        _ = payload
+        raise BackendOperationError(
+            "backend does not implement response streaming",
+            detail={"error": "unsupported response streaming"},
+        )
+
     @abstractmethod
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
+
+    def stream_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        _ = payload
+        raise BackendOperationError(
+            "backend does not implement completion streaming",
+            detail={"error": "unsupported completion streaming"},
+        )
 
     @abstractmethod
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -323,8 +338,36 @@ class OpenAIHTTPBackendAdapter(BackendAdapter):
     async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/responses", payload)
 
+    async def stream_response(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        async with (
+            httpx.AsyncClient(timeout=None) as client,
+            client.stream(
+                "POST",
+                f"{self.backend.base_url}/v1/responses",
+                json=self._clean_payload(payload),
+            ) as response,
+        ):
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    yield chunk
+
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/completions", payload)
+
+    async def stream_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        async with (
+            httpx.AsyncClient(timeout=None) as client,
+            client.stream(
+                "POST",
+                f"{self.backend.base_url}/v1/completions",
+                json=self._clean_payload(payload),
+            ) as response,
+        ):
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    yield chunk
 
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/embeddings", payload)
