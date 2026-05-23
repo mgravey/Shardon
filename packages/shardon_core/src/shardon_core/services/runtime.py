@@ -29,6 +29,10 @@ from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig
 from shardon_core.config.writer import delete_yaml, ensure_symlink, write_yaml
 from shardon_core.gpu.provider import GPUProvider, NvidiaSMIProvider
 from shardon_core.logging.events import EventLogger
+from shardon_core.model_aliases import (
+    CURRENTLY_LOADED_MODEL_ALIAS,
+    is_currently_loaded_model_alias,
+)
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingRequest
 from shardon_core.state.models import (
     ActiveRequest,
@@ -269,7 +273,83 @@ class ShardonRuntime:
                     "effective_capabilities": self._deployment_effective_capabilities(deployment),
                 },
             )
+        currently_loaded = self._currently_loaded_api_model(snapshot)
+        if currently_loaded is not None:
+            models[CURRENTLY_LOADED_MODEL_ALIAS] = currently_loaded
         return list(models.values())
+
+    def _currently_loaded_deployments(self, snapshot: RuntimeStateSnapshot) -> list[DeploymentConfig]:
+        return [
+            deployment
+            for deployment in self.config.deployments.values()
+            if deployment.enabled
+            and snapshot.deployments.get(deployment.id) is not None
+            and snapshot.deployments[deployment.id].loaded
+        ]
+
+    def _currently_loaded_api_model(self, snapshot: RuntimeStateSnapshot) -> dict[str, Any] | None:
+        deployments = self._currently_loaded_deployments(snapshot)
+        if not deployments:
+            return None
+        loaded_model_names = sorted({deployment.api_model_name for deployment in deployments})
+        tasks = sorted({task for deployment in deployments for task in deployment.tasks})
+        model_capabilities = sorted(
+            {
+                capability
+                for deployment in deployments
+                for capability in self.config.models[deployment.model_id].model_capabilities
+            }
+        )
+        deployment_capabilities = sorted(
+            {
+                capability
+                for deployment in deployments
+                for capability in deployment.deployment_capabilities
+            }
+        )
+        backend_modalities = sorted(
+            {
+                modality
+                for deployment in deployments
+                for modality in (
+                    self.config.backends[deployment.backend_runtime_id].capabilities.modalities
+                    if deployment.backend_runtime_id in self.config.backends
+                    else []
+                )
+            }
+        )
+        effective_capabilities = sorted(
+            {
+                capability
+                for deployment in deployments
+                for capability in self._deployment_effective_capabilities(deployment)
+            }
+        )
+        selected_gpu_group_ids = sorted(
+            {
+                runtime.selected_gpu_group_id or runtime.gpu_group_id
+                for deployment in deployments
+                if (runtime := snapshot.deployments.get(deployment.id)) is not None
+                and (runtime.selected_gpu_group_id or runtime.gpu_group_id) is not None
+            }
+        )
+        return {
+            "id": CURRENTLY_LOADED_MODEL_ALIAS,
+            "object": "model",
+            "owned_by": "shardon",
+            "display_name": "Currently Loaded Model",
+            "alias_target_model_names": loaded_model_names,
+            "current_model_alias": True,
+            "source_model_ids": sorted({deployment.model_id for deployment in deployments}),
+            "backend_runtime_ids": sorted({deployment.backend_runtime_id for deployment in deployments}),
+            "gpu_group_ids": selected_gpu_group_ids,
+            "selected_gpu_group_id": selected_gpu_group_ids[0] if len(selected_gpu_group_ids) == 1 else None,
+            "tasks": tasks,
+            "model_capabilities": model_capabilities,
+            "deployment_capabilities": deployment_capabilities,
+            "backend_modalities": backend_modalities,
+            "effective_capabilities": effective_capabilities,
+        }
 
     async def refresh_backend_health(self) -> RuntimeStateSnapshot:
         results: dict[str, dict[str, Any]] = {}
@@ -349,10 +429,16 @@ class ShardonRuntime:
                 detail={"error": "provide deployment_id or model_name"},
                 status_code=422,
             )
+        snapshot = self.snapshot()
         matches = [
             deployment
             for deployment in self.config.deployments.values()
             if deployment.api_model_name == model_name
+            or (
+                is_currently_loaded_model_alias(model_name)
+                and snapshot.deployments.get(deployment.id) is not None
+                and snapshot.deployments[deployment.id].loaded
+            )
         ]
         if gpu_group_id is not None:
             matches = [
@@ -1775,10 +1861,8 @@ class ShardonRuntime:
 
         candidates = [
             deployment
-            for deployment in self.config.deployments.values()
-            if deployment.enabled
-            and deployment.api_model_name == model_name
-            and supports_task(deployment)
+            for deployment in self._candidate_deployments_for_model_name(model_name, snapshot)
+            if supports_task(deployment)
             and (
                 required_capability is None
                 or required_capability in self._deployment_effective_capabilities(deployment)
@@ -1822,6 +1906,19 @@ class ShardonRuntime:
                 }
             )
         return {"candidate_deployments": candidate_details}
+
+    def _candidate_deployments_for_model_name(
+        self,
+        model_name: str,
+        snapshot: RuntimeStateSnapshot,
+    ) -> list[DeploymentConfig]:
+        if is_currently_loaded_model_alias(model_name):
+            return self._currently_loaded_deployments(snapshot)
+        return [
+            deployment
+            for deployment in self.config.deployments.values()
+            if deployment.enabled and deployment.api_model_name == model_name
+        ]
 
     def _deployment_effective_capabilities(
         self,

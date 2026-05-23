@@ -9,6 +9,7 @@ import pytest
 from shardon_core.api.schemas import ChatCompletionRequest
 from shardon_core.auth.service import AuthResult
 from shardon_core.gpu.provider import MockGPUProvider
+from shardon_core.model_aliases import CURRENTLY_LOADED_MODEL_ALIAS
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.state.models import ActiveRequest, BatchJobState
 
@@ -136,3 +137,82 @@ def test_unsupported_model_rejected_immediately_without_queueing(tmp_path: Path)
     assert exc.value.detail["model_name"] == "missing-model"
     snapshot = runtime.snapshot()
     assert snapshot.queued_requests == []
+
+
+def test_list_api_models_includes_currently_loaded_alias(tmp_path: Path) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+    runtime.state_store.mutate(
+        lambda snapshot: snapshot.model_copy(
+            update={
+                "deployments": {
+                    **snapshot.deployments,
+                    "chat-a": snapshot.deployments["chat-a"].model_copy(
+                        update={
+                            "loaded": True,
+                            "state": "ready",
+                            "gpu_group_id": "group-a",
+                            "selected_gpu_group_id": "group-a",
+                        }
+                    ),
+                }
+            }
+        )
+    )
+    models = runtime.list_api_models()
+    current = next((item for item in models if item["id"] == CURRENTLY_LOADED_MODEL_ALIAS), None)
+    assert current is not None
+    assert current["display_name"] == "Currently Loaded Model"
+    assert current["alias_target_model_names"] == ["demo-chat"]
+
+
+def test_currently_loaded_alias_routes_to_loaded_deployment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = _copy_repo_fixture(tmp_path)
+    runtime = ShardonRuntime(repo_root=repo_root, gpu_provider=MockGPUProvider())
+    runtime.state_store.mutate(
+        lambda snapshot: snapshot.model_copy(
+            update={
+                "deployments": {
+                    **snapshot.deployments,
+                    "chat-a": snapshot.deployments["chat-a"].model_copy(
+                        update={
+                            "loaded": True,
+                            "state": "ready",
+                            "gpu_group_id": "group-a",
+                            "selected_gpu_group_id": "group-a",
+                        }
+                    ),
+                }
+            }
+        )
+    )
+    auth = AuthResult(
+        id="k1",
+        user_name="alice",
+        priority=100,
+        permissions=["inference"],
+    )
+
+    async def fake_execute_request(**kwargs: object) -> dict[str, object]:
+        deployment = kwargs["deployment"]
+        return {
+            "deployment_id": deployment.id,
+            "api_model_name": deployment.api_model_name,
+        }
+
+    monkeypatch.setattr(runtime, "_execute_request", fake_execute_request)
+
+    response = asyncio.run(
+        runtime.route_chat(
+            ChatCompletionRequest(
+                model=CURRENTLY_LOADED_MODEL_ALIAS,
+                messages=[{"role": "user", "content": "ping"}],
+            ),
+            auth,
+        )
+    )
+    assert response["deployment_id"] == "chat-a"
+    assert response["api_model_name"] == "demo-chat"
