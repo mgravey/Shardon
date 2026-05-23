@@ -10,6 +10,7 @@ from shardon_core.config.schemas import (
     ModelConfig,
     RepositoryConfig,
 )
+from shardon_core.model_aliases import CURRENTLY_LOADED_MODEL_ALIAS
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingRequest
 from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, GPUObservation, RuntimeStateSnapshot
 
@@ -114,6 +115,29 @@ def test_scheduler_prefers_loaded_compatible_deployment() -> None:
     )
     assert decision.accepted is True
     assert decision.deployment_id == "dep-a"
+    assert decision.should_load is False
+
+
+def test_scheduler_routes_currently_loaded_alias_to_loaded_deployment() -> None:
+    scheduler = SchedulerEngine(_config())
+    snapshot = RuntimeStateSnapshot(
+        deployments={
+            "dep-b": DeploymentRuntimeState(
+                deployment_id="dep-b",
+                gpu_group_id="group-1",
+                backend_runtime_id="backend-b",
+                loaded=True,
+                last_used_at="2026-04-21T00:00:00+00:00",
+            )
+        }
+    )
+    decision = scheduler.schedule(
+        SchedulingRequest(CURRENTLY_LOADED_MODEL_ALIAS, "chat", 100, "interactive", "req-current"),
+        snapshot,
+        datetime.now(tz=UTC),
+    )
+    assert decision.accepted is True
+    assert decision.deployment_id == "dep-b"
     assert decision.should_load is False
 
 

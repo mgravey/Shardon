@@ -1,5 +1,10 @@
 # Changes
 
+## 2026-05-23
+
+- Added a synthetic `currently-loaded` model entry to `GET /v1/models` whenever at least one deployment is already loaded.
+- Requests targeting `currently-loaded` now route to one of the currently loaded compatible deployments, so clients can reuse the active model without knowing its configured API model name.
+
 ## 2026-04-27
 
 - Added router support for `POST /v1/responses` and forwards Responses API create payloads to OpenAI-compatible backends.

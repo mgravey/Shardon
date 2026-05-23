@@ -60,6 +60,7 @@ Individual services are also available:
 - Drains are blocking runtime operations, not long-lived reservations.
 - When a request needs another deployment on the same GPU group, idle loaded deployments can be evicted and unloaded first so memory can be reclaimed for the new load.
 - Requests for unsupported/unconfigured models are rejected immediately and are not added to the interactive queue.
+- `GET /v1/models` exposes a synthetic `currently-loaded` model alias whenever at least one deployment is already loaded; requests to that alias reuse one of the currently loaded compatible deployments instead of requiring the caller to know the concrete configured model name.
 
 ## Model Downloads
 

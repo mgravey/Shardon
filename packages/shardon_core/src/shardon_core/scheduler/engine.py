@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Literal
 
 from shardon_core.config.schemas import DeploymentConfig, GPUGroupConfig, RepositoryConfig
+from shardon_core.model_aliases import is_currently_loaded_model_alias
 from shardon_core.state.models import ActiveRequest, RuntimeStateSnapshot
 
 
@@ -43,7 +44,7 @@ class SchedulerEngine:
         snapshot: RuntimeStateSnapshot,
         now: datetime,
     ) -> SchedulingDecision:
-        candidates = self._matching_deployments(request)
+        candidates = self._matching_deployments(request, snapshot)
         if not candidates:
             return SchedulingDecision(False, None, None, None, 404, "no compatible deployment")
 
@@ -155,12 +156,25 @@ class SchedulerEngine:
                 )
         return SchedulingDecision(False, None, None, None, 409, "no deployment currently admissible")
 
-    def _matching_deployments(self, request: SchedulingRequest) -> list[DeploymentConfig]:
+    def _matching_deployments(
+        self,
+        request: SchedulingRequest,
+        snapshot: RuntimeStateSnapshot,
+    ) -> list[DeploymentConfig]:
         if request.deployment_id is not None:
             deployment = self.config.deployments.get(request.deployment_id)
             if deployment is None or not deployment.enabled:
                 return []
             return [deployment]
+        if is_currently_loaded_model_alias(request.model_name):
+            return [
+                deployment
+                for deployment in self.config.deployments.values()
+                if deployment.enabled
+                and snapshot.deployments.get(deployment.id) is not None
+                and snapshot.deployments[deployment.id].loaded
+                and self._deployment_supports_request(deployment, request)
+            ]
         return [
             deployment
             for deployment in self.config.deployments.values()
@@ -318,7 +332,11 @@ class SchedulerEngine:
         queued_for_group = [
             request
             for request in snapshot.queued_requests
-            if request.request_class == "interactive" and request.model_name in loaded_model_names
+            if request.request_class == "interactive"
+            and (
+                request.model_name in loaded_model_names
+                or is_currently_loaded_model_alias(request.model_name)
+            )
         ]
         if not queued_for_group:
             return True
