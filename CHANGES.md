@@ -1,5 +1,13 @@
 # Changes
 
+## 2026-08-16
+
+- Fixed dynamic backend recovery when a tracked process exits or a still-running parent loses its serving child and the backend health endpoint becomes unreachable.
+- Added single-flight per-deployment lifecycle locking so concurrent requests share one backend start/recovery operation.
+- Added a strict one-retry policy for connection-level failures in non-streaming requests and in streaming requests before the first emitted chunk; HTTP status errors do not trigger recovery.
+- Made the router background scheduler survive and report failed health/scheduling ticks instead of terminating its task.
+- Added lifecycle recovery diagnostics and mocked regression coverage for dead PIDs, unreachable health, bounded request retry, concurrent starts, streaming recovery, HTTP `4xx` behavior, manual unload/on-demand reload, and background-loop resilience.
+
 ## 2026-04-27
 
 - Added router support for `POST /v1/responses` and forwards Responses API create payloads to OpenAI-compatible backends.

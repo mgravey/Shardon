@@ -205,3 +205,6 @@ state/**/*.trace
 state/**/*responses-debug*.json
 state/**/*.sse
 bootstrap.log
+# Backend crashes may leave native runtime core dumps in the repository working tree.
+core
+core.*

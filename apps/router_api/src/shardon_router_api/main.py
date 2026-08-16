@@ -44,6 +44,24 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+async def _run_background_tick(runtime: ShardonRuntime) -> None:
+    try:
+        runtime.refresh_gpu_observations()
+        runtime.enforce_keep_free()
+        await runtime.refresh_backend_health()
+        await runtime.process_one_batch()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            runtime.event_logger.emit(
+                "router.background_failed",
+                "router background scheduler tick failed",
+                error=str(exc),
+                recovery_result="will_retry_next_tick",
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
@@ -51,10 +69,7 @@ async def lifespan(app: FastAPI):
 
     async def background() -> None:
         while not stop_event.is_set():
-            runtime.refresh_gpu_observations()
-            runtime.enforce_keep_free()
-            await runtime.refresh_backend_health()
-            await runtime.process_one_batch()
+            await _run_background_tick(runtime)
             await asyncio.sleep(runtime.config.global_config.scheduler_tick_seconds)
 
     task = asyncio.create_task(background())

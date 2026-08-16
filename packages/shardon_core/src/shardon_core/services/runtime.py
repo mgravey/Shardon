@@ -22,6 +22,7 @@ from shardon_core.backends.base import (
     BackendBinaryResponse,
     BackendOperationError,
     UploadedFilePayload,
+    is_backend_connection_error,
 )
 from shardon_core.backends.registry import BackendRegistry
 from shardon_core.config.loader import load_repository_config
@@ -72,8 +73,12 @@ class ShardonRuntime:
         self.gpu_provider = gpu_provider or NvidiaSMIProvider()
         self.scheduler = SchedulerEngine(self.config)
         self.backends = BackendRegistry(self.config, self.state_root, self.event_logger)
+        self._deployment_locks: dict[str, asyncio.Lock] = {}
         self.service_user = getpass.getuser()
         self.state_store.mutate(self._reconcile_loaded_processes)
+
+    def _deployment_lock(self, deployment_id: str) -> asyncio.Lock:
+        return self._deployment_locks.setdefault(deployment_id, asyncio.Lock())
 
     def reload_config(self) -> RepositoryConfig:
         self.config = load_repository_config(self.config_root)
@@ -396,6 +401,7 @@ class ShardonRuntime:
                     "payload": payload,
                 }
             except Exception as exc:
+                reason = f"backend health unreachable: {exc}"
                 results[deployment.id] = {
                     "ok": False,
                     "status": "unreachable",
@@ -413,8 +419,33 @@ class ShardonRuntime:
                         deployment_id=deployment.id,
                         backend_runtime_id=deployment.backend_runtime_id,
                         gpu_group_id=selected_gpu_group_id,
+                        old_pid=runtime_state.process_id,
+                        reason=reason,
                         error=str(exc),
                     )
+                if runtime_state.loaded:
+                    try:
+                        await self._invalidate_unhealthy_backend(
+                            deployment,
+                            selected_gpu_group_id=selected_gpu_group_id,
+                            observed_pid=runtime_state.process_id,
+                            reason=reason,
+                            source="health_check",
+                        )
+                    except (asyncio.CancelledError, GeneratorExit):
+                        raise
+                    except Exception as cleanup_exc:
+                        self.event_logger.emit(
+                            "backend.recovery",
+                            "failed to invalidate unhealthy backend",
+                            deployment_id=deployment.id,
+                            backend_runtime_id=deployment.backend_runtime_id,
+                            gpu_group_id=selected_gpu_group_id,
+                            old_pid=runtime_state.process_id,
+                            reason=reason,
+                            recovery_result="cleanup_failed",
+                            error=str(cleanup_exc),
+                        )
         return self.state_store.mutate(lambda snapshot: self._set_backend_health(snapshot, results))
 
     def resolve_deployment(
@@ -570,33 +601,38 @@ class ShardonRuntime:
 
     async def unload_deployment(self, deployment_id: str, *, actor: str = "operator") -> dict[str, Any]:
         deployment = self.resolve_deployment(deployment_id=deployment_id)
-        snapshot = self.snapshot()
-        runtime_state = snapshot.deployments.get(deployment.id)
-        if runtime_state is None or not runtime_state.loaded:
-            return {"status": "ok", "detail": "deployment already unloaded", "deployment_id": deployment.id}
-        if runtime_state.active_request_ids:
-            raise RuntimeOperationError(
-                "deployment still serving requests",
-                detail={
-                    "error": "deployment still serving requests",
+        async with self._deployment_lock(deployment.id):
+            snapshot = self.snapshot()
+            runtime_state = snapshot.deployments.get(deployment.id)
+            if runtime_state is None or not runtime_state.loaded:
+                return {
+                    "status": "ok",
+                    "detail": "deployment already unloaded",
                     "deployment_id": deployment.id,
-                    "active_request_ids": runtime_state.active_request_ids,
-                },
-                status_code=409,
-            )
-        self._ensure_supervised_process(deployment.id, runtime_state)
-        self.backends.stop(
-            deployment.id,
-            gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
-            force=False,
-        )
-        self.state_store.mutate(
-            lambda state: self._mark_unloaded(
-                state,
+                }
+            if runtime_state.active_request_ids:
+                raise RuntimeOperationError(
+                    "deployment still serving requests",
+                    detail={
+                        "error": "deployment still serving requests",
+                        "deployment_id": deployment.id,
+                        "active_request_ids": runtime_state.active_request_ids,
+                    },
+                    status_code=409,
+                )
+            self._ensure_supervised_process(deployment.id, runtime_state)
+            self.backends.stop(
                 deployment.id,
-                reason=f"manual unload requested by {actor}",
+                gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+                force=False,
             )
-        )
+            self.state_store.mutate(
+                lambda state: self._mark_unloaded(
+                    state,
+                    deployment.id,
+                    reason=f"manual unload requested by {actor}",
+                )
+            )
         self.event_logger.audit("runtime.unload", actor, deployment_id=deployment.id)
         return {"status": "ok", "deployment_id": deployment.id}
 
@@ -1144,7 +1180,7 @@ class ShardonRuntime:
         should_evict: list[str],
         uploaded_file: UploadedFilePayload | None,
     ) -> Any:
-        snapshot = self.snapshot()
+        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
         current = snapshot.deployments.get(deployment.id)
         current_gpu_group_id = (
             (current.selected_gpu_group_id or current.gpu_group_id)
@@ -1191,65 +1227,124 @@ class ShardonRuntime:
                 target_gpu_group_id,
             )
         )
-        adapter = self.backends.adapter_for(
-            deployment.backend_runtime_id,
-            gpu_group_id=target_gpu_group_id,
-        )
-        try:
-            if task == "chat":
-                result = await adapter.invoke_chat(payload)
-            elif task == "response":
-                result = await adapter.invoke_response(payload)
-            elif task == "completion":
-                result = await adapter.invoke_completion(payload)
-            elif task == "embedding":
-                result = await adapter.invoke_embeddings(payload)
-            elif task == "audio_speech":
-                result = await adapter.invoke_audio_speech(payload)
-            elif task == "audio_transcription":
-                if uploaded_file is None:
-                    raise RuntimeOperationError(
-                        "missing audio file for transcription",
-                        detail={"error": "missing audio file for transcription"},
-                        status_code=422,
-                    )
-                result = await adapter.invoke_audio_transcription(payload, uploaded_file)
-            elif task == "audio_translation":
-                if uploaded_file is None:
-                    raise RuntimeOperationError(
-                        "missing audio file for translation",
-                        detail={"error": "missing audio file for translation"},
-                        status_code=422,
-                    )
-                result = await adapter.invoke_audio_translation(payload, uploaded_file)
-            else:
-                result = await adapter.invoke_multimodal_operation(
-                    task,
+        observed_pid = self.snapshot().deployments[deployment.id].process_id
+        recovery_attempts = 0
+        while True:
+            adapter = self.backends.adapter_for(
+                deployment.backend_runtime_id,
+                gpu_group_id=target_gpu_group_id,
+            )
+            try:
+                result = await self._invoke_backend_request(
+                    adapter,
+                    task=task,
                     payload=payload,
                     uploaded_file=uploaded_file,
                 )
-            self.state_store.mutate(
-                lambda state: self._mark_request_finished(state, request_id, deployment.id)
-            )
-            return result
-        except RuntimeOperationError:
-            raise
-        except Exception as exc:
-            error = str(exc)
-            self.state_store.mutate(
-                lambda state: self._mark_request_failed(state, request_id, deployment.id, error)
-            )
-            raise RuntimeOperationError(
-                "backend request failed",
-                detail={
-                    "error": "backend request failed",
-                    "deployment_id": deployment.id,
-                    "backend_runtime_id": deployment.backend_runtime_id,
-                    "gpu_group_id": target_gpu_group_id,
-                    "detail": error,
-                },
-                status_code=409,
-            ) from exc
+                self.state_store.mutate(
+                    lambda state: self._mark_request_finished(state, request_id, deployment.id)
+                )
+                return result
+            except RuntimeOperationError as exc:
+                runtime_error = str(exc)
+                self.state_store.mutate(
+                    lambda state, runtime_error=runtime_error: self._mark_request_failed(
+                        state,
+                        request_id,
+                        deployment.id,
+                        runtime_error,
+                    )
+                )
+                raise
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except Exception as exc:
+                if recovery_attempts == 0 and is_backend_connection_error(exc):
+                    recovery_attempts = 1
+                    connection_error = str(exc)
+                    try:
+                        await self._recover_backend_for_request(
+                            deployment,
+                            selected_gpu_group_id=target_gpu_group_id,
+                            observed_pid=observed_pid,
+                            request_id=request_id,
+                            error=connection_error,
+                        )
+                    except RuntimeOperationError:
+                        self.state_store.mutate(
+                            lambda state, connection_error=connection_error: (
+                                self._mark_request_failed(
+                                    state,
+                                    request_id,
+                                    deployment.id,
+                                    connection_error,
+                                )
+                            )
+                        )
+                        raise
+                    observed_pid = self.snapshot().deployments[deployment.id].process_id
+                    continue
+                error = str(exc)
+                self.state_store.mutate(
+                    lambda state, error=error: self._mark_request_failed(
+                        state,
+                        request_id,
+                        deployment.id,
+                        error,
+                    )
+                )
+                raise RuntimeOperationError(
+                    "backend request failed",
+                    detail={
+                        "error": "backend request failed",
+                        "deployment_id": deployment.id,
+                        "backend_runtime_id": deployment.backend_runtime_id,
+                        "gpu_group_id": target_gpu_group_id,
+                        "detail": error,
+                        "recovery_attempts": recovery_attempts,
+                    },
+                    status_code=409,
+                ) from exc
+
+    async def _invoke_backend_request(
+        self,
+        adapter: Any,
+        *,
+        task: str,
+        payload: dict[str, Any],
+        uploaded_file: UploadedFilePayload | None,
+    ) -> Any:
+        if task == "chat":
+            return await adapter.invoke_chat(payload)
+        if task == "response":
+            return await adapter.invoke_response(payload)
+        if task == "completion":
+            return await adapter.invoke_completion(payload)
+        if task == "embedding":
+            return await adapter.invoke_embeddings(payload)
+        if task == "audio_speech":
+            return await adapter.invoke_audio_speech(payload)
+        if task == "audio_transcription":
+            if uploaded_file is None:
+                raise RuntimeOperationError(
+                    "missing audio file for transcription",
+                    detail={"error": "missing audio file for transcription"},
+                    status_code=422,
+                )
+            return await adapter.invoke_audio_transcription(payload, uploaded_file)
+        if task == "audio_translation":
+            if uploaded_file is None:
+                raise RuntimeOperationError(
+                    "missing audio file for translation",
+                    detail={"error": "missing audio file for translation"},
+                    status_code=422,
+                )
+            return await adapter.invoke_audio_translation(payload, uploaded_file)
+        return await adapter.invoke_multimodal_operation(
+            task,
+            payload=payload,
+            uploaded_file=uploaded_file,
+        )
 
     async def _execute_stream_request(
         self,
@@ -1268,7 +1363,7 @@ class ShardonRuntime:
                 detail={"error": "unsupported streaming task", "task": task},
                 status_code=409,
             )
-        snapshot = self.snapshot()
+        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
         current = snapshot.deployments.get(deployment.id)
         current_gpu_group_id = (
             (current.selected_gpu_group_id or current.gpu_group_id)
@@ -1315,48 +1410,100 @@ class ShardonRuntime:
                 target_gpu_group_id,
             )
         )
-        adapter = self.backends.adapter_for(
-            deployment.backend_runtime_id,
-            gpu_group_id=target_gpu_group_id,
-        )
-        try:
-            if task == "response":
-                stream = adapter.stream_response(payload)
-            else:
-                stream = adapter.stream_completion(payload)
-            async for chunk in stream:
-                yield chunk
-            self.state_store.mutate(
-                lambda state: self._mark_request_finished(state, request_id, deployment.id)
+        observed_pid = self.snapshot().deployments[deployment.id].process_id
+        recovery_attempts = 0
+        sent_any_chunk = False
+        while True:
+            adapter = self.backends.adapter_for(
+                deployment.backend_runtime_id,
+                gpu_group_id=target_gpu_group_id,
             )
-        except RuntimeOperationError:
-            raise
-        except (asyncio.CancelledError, GeneratorExit):
-            self.state_store.mutate(
-                lambda state: self._mark_request_failed(
-                    state,
-                    request_id,
-                    deployment.id,
-                    "stream cancelled",
+            try:
+                stream = (
+                    adapter.stream_response(payload)
+                    if task == "response"
+                    else adapter.stream_completion(payload)
                 )
-            )
-            raise
-        except Exception as exc:
-            error = str(exc)
-            self.state_store.mutate(
-                lambda state: self._mark_request_failed(state, request_id, deployment.id, error)
-            )
-            raise RuntimeOperationError(
-                "backend streaming request failed",
-                detail={
-                    "error": "backend streaming request failed",
-                    "deployment_id": deployment.id,
-                    "backend_runtime_id": deployment.backend_runtime_id,
-                    "gpu_group_id": target_gpu_group_id,
-                    "detail": error,
-                },
-                status_code=409,
-            ) from exc
+                async for chunk in stream:
+                    sent_any_chunk = True
+                    yield chunk
+                self.state_store.mutate(
+                    lambda state: self._mark_request_finished(state, request_id, deployment.id)
+                )
+                return
+            except RuntimeOperationError as exc:
+                runtime_error = str(exc)
+                self.state_store.mutate(
+                    lambda state, runtime_error=runtime_error: self._mark_request_failed(
+                        state,
+                        request_id,
+                        deployment.id,
+                        runtime_error,
+                    )
+                )
+                raise
+            except (asyncio.CancelledError, GeneratorExit):
+                self.state_store.mutate(
+                    lambda state: self._mark_request_failed(
+                        state,
+                        request_id,
+                        deployment.id,
+                        "stream cancelled",
+                    )
+                )
+                raise
+            except Exception as exc:
+                if (
+                    recovery_attempts == 0
+                    and not sent_any_chunk
+                    and is_backend_connection_error(exc)
+                ):
+                    recovery_attempts = 1
+                    connection_error = str(exc)
+                    try:
+                        await self._recover_backend_for_request(
+                            deployment,
+                            selected_gpu_group_id=target_gpu_group_id,
+                            observed_pid=observed_pid,
+                            request_id=request_id,
+                            error=connection_error,
+                        )
+                    except RuntimeOperationError:
+                        self.state_store.mutate(
+                            lambda state, connection_error=connection_error: (
+                                self._mark_request_failed(
+                                    state,
+                                    request_id,
+                                    deployment.id,
+                                    connection_error,
+                                )
+                            )
+                        )
+                        raise
+                    observed_pid = self.snapshot().deployments[deployment.id].process_id
+                    continue
+                error = str(exc)
+                self.state_store.mutate(
+                    lambda state, error=error: self._mark_request_failed(
+                        state,
+                        request_id,
+                        deployment.id,
+                        error,
+                    )
+                )
+                raise RuntimeOperationError(
+                    "backend streaming request failed",
+                    detail={
+                        "error": "backend streaming request failed",
+                        "deployment_id": deployment.id,
+                        "backend_runtime_id": deployment.backend_runtime_id,
+                        "gpu_group_id": target_gpu_group_id,
+                        "detail": error,
+                        "recovery_attempts": recovery_attempts,
+                        "stream_started": sent_any_chunk,
+                    },
+                    status_code=409,
+                ) from exc
 
     def _prepare_group_for_load(self, deployment_ids: list[str], *, reason: str) -> None:
         snapshot = self.snapshot()
@@ -1397,25 +1544,274 @@ class ShardonRuntime:
             started_at=runtime_state.loaded_at or utc_now_iso(),
         )
 
+    async def _stop_unhealthy_backend(
+        self,
+        deployment: DeploymentConfig,
+        runtime_state: DeploymentRuntimeState,
+        *,
+        gpu_group_id: str,
+    ) -> None:
+        if runtime_state.process_id is None:
+            return
+        self._ensure_supervised_process(deployment.id, runtime_state)
+        try:
+            await asyncio.to_thread(
+                self.backends.stop,
+                deployment.id,
+                gpu_group_id=gpu_group_id,
+                force=False,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                self.backends.stop,
+                deployment.id,
+                gpu_group_id=gpu_group_id,
+                force=True,
+            )
+
+    async def _invalidate_unhealthy_backend(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        selected_gpu_group_id: str,
+        observed_pid: int | None,
+        reason: str,
+        source: str,
+    ) -> None:
+        async with self._deployment_lock(deployment.id):
+            current = self.snapshot().deployments.get(deployment.id)
+            if current is None:
+                return
+            current_pid = current.process_id
+            if (
+                observed_pid is not None
+                and current.loaded
+                and current_pid is not None
+                and current_pid != observed_pid
+            ):
+                self.event_logger.emit(
+                    "backend.recovery",
+                    "ignored a stale backend failure signal",
+                    deployment_id=deployment.id,
+                    backend_runtime_id=deployment.backend_runtime_id,
+                    gpu_group_id=selected_gpu_group_id,
+                    old_pid=observed_pid,
+                    reason=reason,
+                    recovery_result="newer_backend_already_ready",
+                    source=source,
+                    new_pid=current_pid,
+                )
+                return
+            if not current.loaded and current.process_id is None:
+                return
+            old_pid = current.process_id or observed_pid
+            try:
+                await self._stop_unhealthy_backend(
+                    deployment,
+                    current,
+                    gpu_group_id=selected_gpu_group_id,
+                )
+            except Exception as exc:
+                cleanup_error = str(exc)
+                self.state_store.mutate(
+                    lambda state, cleanup_error=cleanup_error: self._mark_unavailable(
+                        state,
+                        deployment.id,
+                        reason=reason,
+                        error=f"failed to stop unhealthy backend: {cleanup_error}",
+                    )
+                )
+                self.event_logger.emit(
+                    "backend.recovery",
+                    "failed to clean up unhealthy backend",
+                    deployment_id=deployment.id,
+                    backend_runtime_id=deployment.backend_runtime_id,
+                    gpu_group_id=selected_gpu_group_id,
+                    old_pid=old_pid,
+                    reason=reason,
+                    recovery_result="cleanup_failed",
+                    source=source,
+                    error=str(exc),
+                )
+                raise
+            self.state_store.mutate(
+                lambda state: self._mark_unavailable(
+                    state,
+                    deployment.id,
+                    reason=reason,
+                    error=reason,
+                    preserve_active_requests=source == "request",
+                )
+            )
+            self.event_logger.emit(
+                "backend.recovery",
+                "cleaned up unhealthy backend and marked it unavailable",
+                deployment_id=deployment.id,
+                backend_runtime_id=deployment.backend_runtime_id,
+                gpu_group_id=selected_gpu_group_id,
+                old_pid=old_pid,
+                reason=reason,
+                recovery_result="marked_unavailable",
+                source=source,
+            )
+
+    async def _recover_backend_for_request(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        selected_gpu_group_id: str,
+        observed_pid: int | None,
+        request_id: str,
+        error: str,
+    ) -> None:
+        reason = f"request {request_id} connection failure: {error}"
+        async with self._deployment_lock(deployment.id):
+            current = self.snapshot().deployments.get(deployment.id)
+            current_pid = current.process_id if current is not None else None
+            if (
+                observed_pid is not None
+                and current is not None
+                and current.loaded
+                and current_pid is not None
+                and current_pid != observed_pid
+            ):
+                self.event_logger.emit(
+                    "backend.recovery",
+                    "reused backend recovered by another request",
+                    deployment_id=deployment.id,
+                    backend_runtime_id=deployment.backend_runtime_id,
+                    gpu_group_id=selected_gpu_group_id,
+                    old_pid=observed_pid,
+                    reason=reason,
+                    recovery_result="newer_backend_already_ready",
+                    source="request",
+                    request_id=request_id,
+                    new_pid=current_pid,
+                )
+                return
+            old_pid = current_pid or observed_pid
+            self.event_logger.emit(
+                "backend.recovery_started",
+                "recovering backend after request connection failure",
+                deployment_id=deployment.id,
+                backend_runtime_id=deployment.backend_runtime_id,
+                gpu_group_id=selected_gpu_group_id,
+                old_pid=old_pid,
+                reason=reason,
+                recovery_result="started",
+                source="request",
+                request_id=request_id,
+            )
+            try:
+                if current is not None and (current.loaded or current.process_id is not None):
+                    await self._stop_unhealthy_backend(
+                        deployment,
+                        current,
+                        gpu_group_id=selected_gpu_group_id,
+                    )
+                self.state_store.mutate(
+                    lambda state: self._mark_unavailable(
+                        state,
+                        deployment.id,
+                        reason=reason,
+                        error=error,
+                        preserve_active_requests=True,
+                    )
+                )
+                await self._start_and_mark_ready_locked(
+                    deployment,
+                    selected_gpu_group_id=selected_gpu_group_id,
+                    reason=f"automatic recovery for request {request_id}",
+                )
+            except Exception as exc:
+                self.event_logger.emit(
+                    "backend.recovery_failed",
+                    "backend recovery failed",
+                    deployment_id=deployment.id,
+                    backend_runtime_id=deployment.backend_runtime_id,
+                    gpu_group_id=selected_gpu_group_id,
+                    old_pid=old_pid,
+                    reason=reason,
+                    recovery_result="failed",
+                    source="request",
+                    request_id=request_id,
+                    error=str(exc),
+                )
+                detail = exc.detail if isinstance(exc, RuntimeOperationError) else {"error": str(exc)}
+                raise RuntimeOperationError(
+                    "backend recovery failed",
+                    detail={
+                        "error": "backend recovery failed",
+                        "deployment_id": deployment.id,
+                        "backend_runtime_id": deployment.backend_runtime_id,
+                        "gpu_group_id": selected_gpu_group_id,
+                        "old_pid": old_pid,
+                        "reason": reason,
+                        "recovery_attempts": 1,
+                        "recovery": detail,
+                    },
+                    status_code=409,
+                ) from exc
+            new_pid = self.snapshot().deployments[deployment.id].process_id
+            self.event_logger.emit(
+                "backend.recovery_succeeded",
+                "backend recovered and passed readiness",
+                deployment_id=deployment.id,
+                backend_runtime_id=deployment.backend_runtime_id,
+                gpu_group_id=selected_gpu_group_id,
+                old_pid=old_pid,
+                new_pid=new_pid,
+                reason=reason,
+                recovery_result="ready",
+                source="request",
+                request_id=request_id,
+            )
+
     def _reconcile_loaded_processes(self, snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         for deployment_id, runtime_state in snapshot.deployments.items():
             if not runtime_state.loaded:
                 continue
             if runtime_state.process_id is None:
-                self._mark_unloaded(
+                reason = "state reconciliation: missing process_id for loaded deployment"
+                self._mark_unavailable(
                     snapshot,
                     deployment_id,
-                    reason="state reconciliation: missing process_id for loaded deployment",
+                    reason=reason,
+                    error="tracked backend process is missing",
+                )
+                self.event_logger.emit(
+                    "backend.recovery",
+                    "marked deployment unavailable during process reconciliation",
+                    deployment_id=deployment_id,
+                    backend_runtime_id=runtime_state.backend_runtime_id,
+                    gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+                    old_pid=None,
+                    reason=reason,
+                    recovery_result="marked_unavailable",
                 )
                 continue
             try:
                 os.kill(runtime_state.process_id, 0)
             except OSError:
-                self._mark_unloaded(
+                old_pid = runtime_state.process_id
+                reason = "state reconciliation: tracked process is not running"
+                self.backends.supervisor.processes.pop(deployment_id, None)
+                self._mark_unavailable(
                     snapshot,
                     deployment_id,
-                    reason="state reconciliation: process not running",
+                    reason=reason,
+                    error="tracked backend process is not running",
+                )
+                self.event_logger.emit(
+                    "backend.recovery",
+                    "marked deployment unavailable during process reconciliation",
+                    deployment_id=deployment_id,
+                    backend_runtime_id=runtime_state.backend_runtime_id,
+                    gpu_group_id=runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id,
+                    old_pid=old_pid,
+                    reason=reason,
+                    recovery_result="marked_unavailable",
                 )
                 continue
             self._ensure_supervised_process(deployment_id, runtime_state)
@@ -1454,6 +1850,28 @@ class ShardonRuntime:
         selected_gpu_group_id: str,
         reason: str,
     ) -> None:
+        async with self._deployment_lock(deployment.id):
+            await self._start_and_mark_ready_locked(
+                deployment,
+                selected_gpu_group_id=selected_gpu_group_id,
+                reason=reason,
+            )
+
+    async def _start_and_mark_ready_locked(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        selected_gpu_group_id: str,
+        reason: str,
+    ) -> None:
+        current = self.snapshot().deployments.get(deployment.id)
+        if (
+            current is not None
+            and current.loaded
+            and (current.selected_gpu_group_id or current.gpu_group_id)
+            == selected_gpu_group_id
+        ):
+            return
         self.state_store.mutate(
             lambda state: self._mark_starting(
                 state,
@@ -1571,6 +1989,28 @@ class ShardonRuntime:
         runtime.last_readiness_detail = detail
         return snapshot
 
+    def _mark_unavailable(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment_id: str,
+        *,
+        reason: str,
+        error: str,
+        preserve_active_requests: bool = False,
+    ) -> RuntimeStateSnapshot:
+        runtime = snapshot.deployments[deployment_id]
+        runtime.loaded = False
+        runtime.state = "failed"
+        runtime.desired_state = "unloaded"
+        runtime.selected_gpu_group_id = None
+        runtime.process_id = None
+        runtime.resident_memory_fraction = 0.0
+        if not preserve_active_requests:
+            runtime.active_request_ids = []
+        runtime.last_error = error
+        runtime.last_transition_reason = reason
+        return snapshot
+
     def _mark_unloaded(
         self,
         snapshot: RuntimeStateSnapshot,
@@ -1633,13 +2073,15 @@ class ShardonRuntime:
         request_id: str,
         deployment_id: str,
     ) -> RuntimeStateSnapshot:
-        request = snapshot.active_requests.pop(request_id)
-        request.status = "completed"
-        request.finished_at = utc_now_iso()
+        request = snapshot.active_requests.pop(request_id, None)
+        if request is not None:
+            request.status = "completed"
+            request.finished_at = utc_now_iso()
         runtime = snapshot.deployments[deployment_id]
         runtime.active_request_ids = [item for item in runtime.active_request_ids if item != request_id]
         runtime.last_used_at = utc_now_iso()
-        runtime.state = "ready"
+        if runtime.loaded:
+            runtime.state = "ready"
         self.event_logger.emit(
             "request.completed",
             "request finished",
@@ -1655,14 +2097,16 @@ class ShardonRuntime:
         deployment_id: str,
         error: str,
     ) -> RuntimeStateSnapshot:
-        request = snapshot.active_requests.pop(request_id)
-        request.status = "failed"
-        request.finished_at = utc_now_iso()
-        request.error = error
+        request = snapshot.active_requests.pop(request_id, None)
+        if request is not None:
+            request.status = "failed"
+            request.finished_at = utc_now_iso()
+            request.error = error
         runtime = snapshot.deployments[deployment_id]
         runtime.active_request_ids = [item for item in runtime.active_request_ids if item != request_id]
         runtime.last_used_at = utc_now_iso()
-        runtime.state = "ready"
+        if runtime.loaded:
+            runtime.state = "ready"
         runtime.last_error = error
         self.event_logger.emit(
             "request.failed",

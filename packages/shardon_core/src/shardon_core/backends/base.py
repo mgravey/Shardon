@@ -23,6 +23,22 @@ class BackendOperationError(RuntimeError):
         self.detail = detail
 
 
+def is_backend_connection_error(exc: BaseException) -> bool:
+    """Return whether an adapter failure means the backend could not be reached.
+
+    HTTP status failures are intentionally excluded: an HTTP response proves the
+    backend is reachable and may represent an ordinary client/model error.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.TransportError, ConnectionError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass(slots=True)
 class ManagedProcess:
     deployment_id: str

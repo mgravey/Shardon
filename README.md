@@ -74,8 +74,13 @@ Individual services are also available:
 - JSON responses are stored as health payloads as-is.
 - Non-JSON `2xx` responses (for example plain-text `/health` from some vLLM builds) are accepted and stored with status metadata instead of failing readiness.
 - On startup and periodic health refresh, loaded runtime state is reconciled with live process IDs so stale loaded flags are cleared.
+- A loaded deployment whose process dies or whose health endpoint becomes unreachable is stopped, marked unavailable, and remains eligible for normal on-demand loading.
+- Connection-level request failures trigger one automatic cleanup, relaunch, readiness wait, and retry. Backend HTTP responses such as request-validation `4xx` errors do not restart the backend.
+- Streaming requests use the same recovery path only before their first response chunk; partial streams are never replayed automatically.
+- Per-deployment lifecycle locks prevent concurrent requests and health checks from launching duplicate backend processes.
 - Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
 - Backend stop timeout is a maximum cap: if the process exits immediately after `SIGTERM`, Shardon proceeds without waiting for the full timeout window.
+- Recovery diagnostics are written as `backend.health_failed`, `backend.stop`, `backend.start`, `backend.ready`, and `backend.recovery*` lifecycle events with deployment, GPU group, PID, reason, and result fields.
 
 ## Multimodal Routing
 
