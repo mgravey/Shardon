@@ -236,3 +236,27 @@ def test_currently_loaded_alias_requires_compatible_loaded_deployment(tmp_path: 
     assert exc.value.status_code == 404
     assert exc.value.detail["error"] == "no currently loaded deployment"
 
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_finalization_removes_only_finished_request_from_queue(tmp_path: Path, failed) -> None:
+    runtime = ShardonRuntime(
+        repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider()
+    )
+    snapshot = runtime.snapshot()
+    snapshot.deployments["chat-a"] = _loaded_deployment_state(runtime, "chat-a")
+    request = _queued_request("finished")
+    request.status = "running"
+    snapshot.queued_requests = [request, _queued_request("waiting")]
+    snapshot.active_requests[request.id] = request
+    snapshot.deployments["chat-a"].active_request_ids = [request.id]
+
+    if failed:
+        snapshot = runtime._mark_request_failed(snapshot, request.id, "chat-a", "ReadTimeout: ")
+    else:
+        snapshot = runtime._mark_request_finished(snapshot, request.id, "chat-a")
+
+    # Verify the finalization mutation itself, before outer routing cleanup runs.
+    assert [item.id for item in snapshot.queued_requests] == ["waiting"]
+    assert snapshot.active_requests == {}
+    assert snapshot.deployments["chat-a"].active_request_ids == []

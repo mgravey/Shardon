@@ -48,6 +48,8 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     temperature: float | None = None
     max_tokens: int | None = None
+    response_format: dict[str, Any] | None = None
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -32,6 +32,11 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 
 ## Quick Start
 
+Python 3.11+ is supported, including Python 3.14. Dependency minimums are FastAPI
+0.118.3, Pydantic 2.12, Uvicorn 0.38, and PyYAML 6.0.3. After an OS/Python upgrade,
+recreate the service virtual environment with the intended interpreter and reinstall
+the workspace dependencies; inference backends have their own environments.
+
 1. Bootstrap a fresh clone with `make setup` or `./scripts/bootstrap.sh`.
 2. Optional: create a repo `.env` from [.env.example](.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
 3. Start the full local stack with `make dev` or `./scripts/run-local.sh`.
@@ -76,6 +81,7 @@ Individual services are also available:
 - On startup and periodic health refresh, loaded runtime state is reconciled with live process IDs so stale loaded flags are cleared.
 - A loaded deployment whose process dies or whose health endpoint becomes unreachable is stopped, marked unavailable, and remains eligible for normal on-demand loading.
 - Connection-level request failures trigger one automatic cleanup, relaunch, readiness wait, and retry. Backend HTTP responses such as request-validation `4xx` errors do not restart the backend.
+- Read, write, and connection-pool timeouts fail the request without restarting the backend; connection timeouts still permit recovery. Request failure diagnostics include the exception type.
 - Streaming requests use the same recovery path only before their first response chunk; partial streams are never replayed automatically.
 - Per-deployment lifecycle locks prevent concurrent requests and health checks from launching duplicate backend processes.
 - Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
@@ -114,6 +120,12 @@ Runtime timeout defaults:
 - `interactive_request_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `backend_startup_timeout_seconds` defaults to `300 + switch_grace_window_seconds` (600s with current defaults).
 - `queue_poll_interval_seconds` controls how often queued interactive requests retry scheduling decisions while waiting for eviction/startup readiness.
+- Backend YAML definitions can set `request_read_timeout_seconds` (default 600) and `request_connect_timeout_seconds` (default 10) for non-streaming JSON inference. Both also support GPU-group overrides; see [Configuration](docs/configuration.md#backend-inference-timeouts).
+
+Chat requests forward optional `response_format` and `reasoning_effort` fields to the
+backend. Supported reasoning values are `none`, `low`, `medium`, `high`, and `xhigh`;
+the selected backend/model must support the requested options. Completed and failed
+requests are removed from the queue in the same state update that finalizes them.
 
 Live router smoke test:
 

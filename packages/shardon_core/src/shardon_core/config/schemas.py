@@ -78,6 +78,8 @@ class BackendRuntimeConfig(BaseModel):
     working_directory: str | None = None
     environment: dict[str, str] = Field(default_factory=dict)
     health_path: str = "/health"
+    request_read_timeout_seconds: float = Field(default=600.0, gt=0, allow_inf_nan=False)
+    request_connect_timeout_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
     startup_timeout_seconds: int | None = None
     readiness_poll_interval_seconds: float | None = None
     stop_timeout_seconds: int | None = None
@@ -102,6 +104,16 @@ class BackendRuntimeConfig(BaseModel):
                     else self.working_directory
                 ),
                 "health_path": override.health_path or self.health_path,
+                "request_read_timeout_seconds": (
+                    override.request_read_timeout_seconds
+                    if override.request_read_timeout_seconds is not None
+                    else self.request_read_timeout_seconds
+                ),
+                "request_connect_timeout_seconds": (
+                    override.request_connect_timeout_seconds
+                    if override.request_connect_timeout_seconds is not None
+                    else self.request_connect_timeout_seconds
+                ),
                 "startup_timeout_seconds": (
                     override.startup_timeout_seconds
                     if override.startup_timeout_seconds is not None
@@ -128,6 +140,8 @@ class BackendRuntimeOverride(BaseModel):
     working_directory: str | None = None
     environment: dict[str, str] = Field(default_factory=dict)
     health_path: str | None = None
+    request_read_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    request_connect_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     startup_timeout_seconds: int | None = None
     readiness_poll_interval_seconds: float | None = None
     stop_timeout_seconds: int | None = None

@@ -45,6 +45,34 @@ Shardon now treats symlinks as the default operational model: enabled entries sh
 - GPU groups define scheduling targets, usable memory fraction, and `keep_free`.
 - Backends may use `gpu_group_overrides` for per-group launch command, base URL, environment, and health/readiness settings while keeping one backend definition.
 
+## Backend Inference Timeouts
+
+Add these optional settings to a canonical backend definition under
+`config/backends-available/`:
+
+```yaml
+request_read_timeout_seconds: 600
+request_connect_timeout_seconds: 10
+gpu_group_overrides:
+  group-b:
+    request_read_timeout_seconds: 900
+```
+
+The read timeout defaults to 600 seconds and the connection timeout to 10 seconds.
+Values must be finite positive numbers (fractional seconds are allowed). Each
+GPU-group override inherits omitted values from the backend definition.
+
+These settings apply to non-streaming JSON requests for chat, Responses,
+Completions, and embeddings. They are HTTPX operation timeouts, not an overall
+request deadline: the read timeout limits the wait for each response chunk.
+Write and pool timeouts remain 120 seconds. Audio, streaming, health checks,
+startup readiness, and scheduler queue waits keep their existing separate timeout
+policies. Restart the admin and router services after editing YAML so both planes
+use the updated configuration.
+
+A read, write, or pool timeout fails the request without restarting the model.
+A connection timeout can still trigger the existing single recovery attempt.
+
 ## Environment Variables
 
 - Use a repo-local `.env` file or normal process environment variables for secrets and machine-specific paths.

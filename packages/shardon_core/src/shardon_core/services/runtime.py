@@ -1261,7 +1261,7 @@ class ShardonRuntime:
             except Exception as exc:
                 if recovery_attempts == 0 and is_backend_connection_error(exc):
                     recovery_attempts = 1
-                    connection_error = str(exc)
+                    connection_error = f"{type(exc).__name__}: {exc}"
                     try:
                         await self._recover_backend_for_request(
                             deployment,
@@ -1284,7 +1284,7 @@ class ShardonRuntime:
                         raise
                     observed_pid = self.snapshot().deployments[deployment.id].process_id
                     continue
-                error = str(exc)
+                error = f"{type(exc).__name__}: {exc}"
                 self.state_store.mutate(
                     lambda state, error=error: self._mark_request_failed(
                         state,
@@ -1459,7 +1459,7 @@ class ShardonRuntime:
                     and is_backend_connection_error(exc)
                 ):
                     recovery_attempts = 1
-                    connection_error = str(exc)
+                    connection_error = f"{type(exc).__name__}: {exc}"
                     try:
                         await self._recover_backend_for_request(
                             deployment,
@@ -1482,7 +1482,7 @@ class ShardonRuntime:
                         raise
                     observed_pid = self.snapshot().deployments[deployment.id].process_id
                     continue
-                error = str(exc)
+                error = f"{type(exc).__name__}: {exc}"
                 self.state_store.mutate(
                     lambda state, error=error: self._mark_request_failed(
                         state,
@@ -2073,6 +2073,7 @@ class ShardonRuntime:
         request_id: str,
         deployment_id: str,
     ) -> RuntimeStateSnapshot:
+        snapshot = self._dequeue_request(snapshot, request_id)
         request = snapshot.active_requests.pop(request_id, None)
         if request is not None:
             request.status = "completed"
@@ -2097,6 +2098,7 @@ class ShardonRuntime:
         deployment_id: str,
         error: str,
     ) -> RuntimeStateSnapshot:
+        snapshot = self._dequeue_request(snapshot, request_id)
         request = snapshot.active_requests.pop(request_id, None)
         if request is not None:
             request.status = "failed"

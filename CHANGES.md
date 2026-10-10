@@ -1,5 +1,13 @@
 # Changes
 
+## 2026-10-10
+
+- Forward optional chat response-format and reasoning-effort options to backends.
+- Avoid restarting backends on read, write, and pool timeouts; retain recovery for connection failures and include exception types in request diagnostics.
+- Make non-streaming JSON inference read/connect timeouts configurable per backend and GPU group, defaulting to 600/10 seconds.
+- Remove completed/failed requests from the queue in the same state mutation as finalization.
+- Raise FastAPI, Pydantic, Uvicorn, and PyYAML minimums for Python 3.14 while retaining Python 3.11+ support.
+
 ## 2026-08-16
 
 - Fixed dynamic backend recovery when a tracked process exits or a still-running parent loses its serving child and the backend health endpoint becomes unreachable.

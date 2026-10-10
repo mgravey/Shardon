@@ -135,6 +135,8 @@ celerybeat.pid
 /.venv/
 /.venv-shardon/
 /.venv-work/
+# Isolated Python-version compatibility test environments.
+/.venv-py*/
 state/**/*.bak*
 state/**/*.tmp
 state/**/*.json

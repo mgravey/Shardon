@@ -439,3 +439,43 @@ def test_router_audio_routes_support_json_and_multipart(tmp_path: Path, monkeypa
     assert transcription_text.status_code == 200
     assert transcription_text.text == "transcribed"
     assert transcription_text.headers["content-type"].startswith("text/plain")
+
+
+def test_chat_route_forwards_output_and_reasoning_options(tmp_path: Path, monkeypatch) -> None:
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id="chat-options", user_name="alice", priority=100,
+        permissions=["inference"], actor="admin",
+    )
+    app = create_router_app()
+    captured = []
+
+    async def capture(task, model_name, payload, auth, **kwargs):
+        assert task == "chat"
+        captured.append(payload)
+        return {"id": "chat-options-ok"}
+
+    app.state.runtime._route_interactive = capture
+    client = TestClient(app)
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {"name": "answer", "schema": {"type": "object"}},
+    }
+    for effort in ["none", "low", "medium", "high", "xhigh"]:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {secret}"},
+            json={
+                "model": "demo-chat",
+                "messages": [{"role": "user", "content": "ping"}],
+                "response_format": response_format,
+                "reasoning_effort": effort,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert captured[-1]["response_format"] == response_format
+        assert captured[-1]["reasoning_effort"] == effort

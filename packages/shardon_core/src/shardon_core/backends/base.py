@@ -33,6 +33,11 @@ def is_backend_connection_error(exc: BaseException) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        # Slow responses and local pool waits do not establish that the backend is dead.
+        if isinstance(current, httpx.TimeoutException) and not isinstance(
+            current, httpx.ConnectTimeout
+        ):
+            return False
         if isinstance(current, (httpx.TransportError, ConnectionError)):
             return True
         current = current.__cause__ or current.__context__
@@ -291,7 +296,12 @@ class OpenAIHTTPBackendAdapter(BackendAdapter):
         return {key: value for key, value in payload.items() if value is not None}
 
     async def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        timeout = httpx.Timeout(
+            120.0,
+            read=self.backend.request_read_timeout_seconds,
+            connect=self.backend.request_connect_timeout_seconds,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{self.backend.base_url}{path}",
                 json=self._clean_payload(payload),

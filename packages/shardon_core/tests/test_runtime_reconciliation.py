@@ -479,3 +479,50 @@ def test_repeated_background_failures_do_not_escape_scheduler_tick(tmp_path: Pat
         event for event in events if event["category"] == "router.background_failed"
     ]
     assert len(background_failures) == 2
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_slow_request_fails_without_backend_restart(
+    tmp_path: Path, monkeypatch, error_type, streaming
+) -> None:
+    runtime = ShardonRuntime(
+        repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider()
+    )
+    _seed_loaded_chat(runtime, pid=4_306)
+    monkeypatch.setattr("shardon_core.services.runtime.os.kill", lambda pid, signal_number: None)
+    stop_calls: list[tuple[str, bool]] = []
+    start_calls: list[str] = []
+    _mock_stop(runtime, stop_calls)
+    _install_fake_start(runtime, start_calls)
+
+    class SlowAdapter:
+        async def invoke_chat(self, payload):
+            raise error_type("")
+
+        async def stream_response(self, payload):
+            raise error_type("")
+            yield b""  # Make this an async generator, like the real adapter.
+
+    runtime.backends.adapter_for = lambda *args, **kwargs: SlowAdapter()
+
+    async def invoke():
+        if streaming:
+            request = ResponseCreateRequest(model="demo-chat", input="ping", stream=True)
+            return [chunk async for chunk in runtime.stream_response(request, _auth())]
+        return await runtime.route_chat(_chat_request(), _auth())
+
+    with pytest.raises(RuntimeOperationError) as exc_info:
+        asyncio.run(invoke())
+
+    assert exc_info.value.detail["recovery_attempts"] == 0
+    assert exc_info.value.detail["detail"] == f"{error_type.__name__}: "
+    assert start_calls == []
+    assert stop_calls == []
+    snapshot = runtime.snapshot()
+    assert snapshot.deployments["chat-a"].loaded is True
+    assert snapshot.deployments["chat-a"].process_id == 4_306
+    assert snapshot.deployments["chat-a"].last_error == f"{error_type.__name__}: "
+    assert snapshot.queued_requests == []
+    assert snapshot.active_requests == {}
+    assert snapshot.deployments["chat-a"].active_request_ids == []
