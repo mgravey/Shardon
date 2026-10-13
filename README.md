@@ -33,9 +33,10 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 ## Install and First Run
 
 Run the commands below from the repository root. The shipped configuration uses
-mock backends and placeholder GPUs: it is suitable for trying the UI and routing
+mock backends, placeholder GPUs, and explicit `gpu_provider: mock`: it is suitable for trying the UI and routing
 without downloading a model. For actual NVIDIA inference, complete the
-[real GPU and backend setup](docs/installation.md#real-gpu-and-backend-setup).
+[real GPU and backend setup](docs/installation.md#real-gpu-and-backend-setup),
+including `gpu_provider: nvidia-smi` in deployment `config/router.yaml`.
 
 ### Prerequisites
 
@@ -180,7 +181,11 @@ troubleshooting, deployment notes, backups, and upgrades, continue with the
 - YAML is desired state.
 - JSON and JSONL are observed state.
 - Backends live in runtime folders and can be run with or without Shardon.
-- GPU groups are first-class scheduling targets.
+- GPU groups are first-class scheduling targets. Missing GPU observations block admission;
+  UUID-pinned devices are never replaced by another GPU at the same PCI address.
+- Deployment configuration supplies both GPU inventory and backend CUDA settings;
+  inventory does not generate the backend environment. See [GPU mapping](docs/gpu-mapping.md)
+  for precedence, per-group overrides, deployment-local files, and isolation limits.
 - A deployment may have one or many eligible GPU groups; Shardon selects one concrete group per running process.
 - Model capabilities are explicit metadata and are independent from request task routing.
 - `keep_free` is enforced aggressively from observed process ownership.
@@ -207,6 +212,8 @@ troubleshooting, deployment notes, backups, and upgrades, continue with the
 - Streaming requests use the same recovery path only before their first response chunk; partial streams are never replayed automatically.
 - Per-deployment lifecycle locks prevent concurrent requests and health checks from launching duplicate backend processes.
 - Repeated identical backend health failures are de-duplicated in `state/events/events.jsonl` to avoid unbounded log spam during idle periods.
+- Startup failures preserve the attempted group, log path, and known exit code in runtime diagnostics;
+  operator log and event endpoints remain available after failure.
 - Backend stop timeout is a maximum cap: if the process exits immediately after `SIGTERM`, Shardon proceeds without waiting for the full timeout window.
 - Recovery diagnostics are written as `backend.health_failed`, `backend.stop`, `backend.start`, `backend.ready`, and `backend.recovery*` lifecycle events with deployment, GPU group, PID, reason, and result fields.
 

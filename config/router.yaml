@@ -1,4 +1,6 @@
 instance_name: shardon-demo
+# Synthetic observations for the GPU-free demo; use nvidia-smi for real inference.
+gpu_provider: mock
 admin_host: 127.0.0.1
 admin_port: 8081
 router_host: 127.0.0.1

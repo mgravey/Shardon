@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pwd
 import subprocess
 from abc import ABC, abstractmethod
@@ -7,6 +8,8 @@ from pathlib import Path
 
 from shardon_core.config.schemas import GPUDeviceConfig
 from shardon_core.state.models import GPUObservation, GPUProcessInfo
+
+logger = logging.getLogger(__name__)
 
 
 class GPUProvider(ABC):
@@ -52,16 +55,22 @@ class NvidiaSMIProvider(GPUProvider):
                 capture_output=True,
                 text=True,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("GPU inventory probe failed; GPUs are unavailable: %s", exc)
             return {}
         by_uuid: dict[str, dict[str, int | str]] = {}
         for line in gpu_output.stdout.splitlines():
-            uuid, pci_bus_id, free_memory, total_memory = [part.strip() for part in line.split(",")]
-            by_uuid[uuid] = {
-                "pci_bus_id": pci_bus_id,
-                "free_memory_mb": int(free_memory),
-                "total_memory_mb": int(total_memory),
-            }
+            try:
+                uuid, pci_bus_id, free_memory, total_memory = [
+                    part.strip() for part in line.split(",")
+                ]
+                by_uuid[uuid] = {
+                    "pci_bus_id": pci_bus_id,
+                    "free_memory_mb": int(free_memory),
+                    "total_memory_mb": int(total_memory),
+                }
+            except ValueError:
+                logger.warning("GPU inventory row unavailable: %r", line)
         processes_by_uuid: dict[str, list[GPUProcessInfo]] = {}
         try:
             proc_output = subprocess.run(
@@ -80,13 +89,21 @@ class NvidiaSMIProvider(GPUProvider):
                 try:
                     user_name = pwd.getpwuid(Path(f"/proc/{pid}").stat().st_uid).pw_name
                 except Exception:
-                    user_name = subprocess.run(
-                        ["ps", "-o", "user=", "-p", str(pid)],
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip() or "unknown"
+                    user_name = (
+                        subprocess.run(
+                            ["ps", "-o", "user=", "-p", str(pid)],
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip()
+                        or "unknown"
+                    )
                 try:
-                    command = Path(f"/proc/{pid}/cmdline").read_text(encoding="utf-8").replace("\x00", " ").strip()
+                    command = (
+                        Path(f"/proc/{pid}/cmdline")
+                        .read_text(encoding="utf-8")
+                        .replace("\x00", " ")
+                        .strip()
+                    )
                 except Exception:
                     command = ""
                 processes_by_uuid.setdefault(gpu_uuid, []).append(
@@ -103,8 +120,10 @@ class NvidiaSMIProvider(GPUProvider):
         observations: dict[str, GPUObservation] = {}
         for gpu_id, device in gpu_devices.items():
             match = None
-            if device.uuid and device.uuid in by_uuid:
-                match = by_uuid[device.uuid]
+            if device.uuid:
+                # A configured UUID pins the device, even if another GPU now
+                # occupies its old PCI address. Never substitute that GPU.
+                match = by_uuid.get(device.uuid)
                 raw_processes = processes_by_uuid.get(device.uuid, [])
             elif device.pci_bus_id:
                 for uuid, item in by_uuid.items():

@@ -222,3 +222,6 @@ output/playwright/
 # Local installation backups and locks used when updating admin credentials.
 /backups/
 config/auth/**/*.lock
+
+# Deployment-local identities/settings and enabled symlinks (ordinary full definitions).
+config/**/*.local.yaml

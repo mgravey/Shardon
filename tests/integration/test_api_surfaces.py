@@ -568,3 +568,39 @@ def test_activity_and_usage_are_public_filtered_and_read_only(tmp_path, monkeypa
     assert requested["totals"]["total_tokens"] == 10
     assert client.get("/runtime/usage?model_view=invalid").status_code == 422
     assert runtime.state_store.snapshot_path.read_bytes() == before
+
+
+def test_admin_can_read_failed_backend_diagnostics_and_logs(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    from shardon_admin_api.main import create_app
+
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(_make_repo_copy(tmp_path)))
+    app = create_app()
+    runtime = app.state.runtime
+    backend = runtime.config.backends[runtime.config.deployments["chat-a"].backend_runtime_id]
+    backend.working_directory = str(tmp_path)
+    backend.launch_command = [
+        sys.executable, "-c",
+        "import sys; print('synthetic GPU unavailable', flush=True); sys.exit(17)",
+    ]
+    backend.startup_timeout_seconds = 3
+    backend.readiness_poll_interval_seconds = 0.01
+
+    async def unavailable_health(*args, **kwargs):
+        raise ConnectionError("synthetic backend unavailable")
+
+    monkeypatch.setattr(runtime.backends, "health", unavailable_health)
+    client = TestClient(app)
+    login = client.post("/auth/login", json={"username": "admin", "password": "admin"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    response = client.post("/runtime/load/chat-a", headers=headers)
+    assert response.status_code == 409
+    assert response.json()["detail"]["readiness"]["returncode"] == 17
+    logs = client.get("/runtime/logs/chat-a", headers=headers)
+    assert logs.status_code == 200
+    assert logs.json()["lines"] == ["synthetic GPU unavailable"]
+    events = client.get("/runtime/events", headers=headers)
+    assert events.status_code == 200
+    assert any('"category": "backend.readiness_failed"' in line for line in events.json()["lines"])
+    assert client.get("/runtime/logs/chat-a").status_code == 401

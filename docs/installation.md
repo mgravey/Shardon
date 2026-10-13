@@ -73,9 +73,16 @@ nvidia-smi
 nvidia-smi --query-gpu=uuid,pci.bus_id,name,memory.total --format=csv
 ```
 
-Replace demo UUIDs and PCI bus IDs under `config/gpu-inventory-available/` with
-values from your machine. Keep identifiers such as `gpu0` stable; use them in
-`gpu_ids` under `config/gpu-groups-available/`.
+Set `gpu_provider: nvidia-smi` in your deployment's `config/router.yaml` and restart
+both services when moving from the demo to real inference. The default when this
+setting is omitted is `nvidia-smi`; the shipped demo explicitly selects `mock`,
+which supplies synthetic observations and cannot detect unavailable hardware.
+
+Supply real UUIDs and optional PCI bus IDs in deployment-local inventory definitions,
+using a separate deployment root or ignored `*.local.yaml` files and enabled links.
+Keep machine-specific values out of tracked demo files. Keep configured GPU IDs
+stable and reference them in each group's `gpu_ids`. See [GPU mapping](gpu-mapping.md)
+for local configuration layout and placeholder examples.
 
 Enable only the inventory, groups, and deployments you intend to use. On a
 one-GPU machine, remove the enabled links for the unused demo GPU/group and any

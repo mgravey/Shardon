@@ -85,6 +85,9 @@ class ProcessSupervisor:
         log_dir = self.state_root / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{deployment.id}.log"
+        # Lowest to highest: inherited environment, resolved backend environment
+        # (base then selected-group overrides), then Shardon launch metadata.
+        # CUDA selection is deployment-supplied and is never derived from inventory.
         env = os.environ.copy()
         env.update(backend.environment)
         env.update(extra_env or {})

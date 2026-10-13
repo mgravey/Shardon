@@ -1,17 +1,23 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from shardon_core.config.schemas import (
     AdminUserRecord,
     BackendRuntimeConfig,
     DeploymentConfig,
+    GlobalConfig,
     GPUDeviceConfig,
     GPUGroupConfig,
-    GlobalConfig,
     ModelConfig,
     RepositoryConfig,
 )
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingRequest
-from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, GPUObservation, RuntimeStateSnapshot
+from shardon_core.state.models import (
+    ActiveRequest,
+    DeploymentRuntimeState,
+    GPUObservation,
+    RuntimeStateSnapshot,
+)
 
 
 def _config() -> RepositoryConfig:
@@ -94,9 +100,20 @@ def _config() -> RepositoryConfig:
     )
 
 
+def _observed_snapshot(**kwargs) -> RuntimeStateSnapshot:
+    kwargs.setdefault(
+        "gpu_observations",
+        {
+            gpu_id: GPUObservation(gpu_id=gpu_id, free_memory_mb=1000, total_memory_mb=1000)
+            for gpu_id in ("gpu0", "gpu1")
+        },
+    )
+    return RuntimeStateSnapshot(**kwargs)
+
+
 def test_scheduler_prefers_loaded_compatible_deployment() -> None:
     scheduler = SchedulerEngine(_config())
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -121,7 +138,7 @@ def test_scheduler_routes_responses_to_chat_deployments_when_backend_supports_re
     scheduler = SchedulerEngine(_config())
     decision = scheduler.schedule(
         SchedulingRequest("alpha", "response", 100, "interactive", "req-response"),
-        RuntimeStateSnapshot(),
+        _observed_snapshot(),
         datetime.now(tz=UTC),
     )
     assert decision.accepted is True
@@ -132,7 +149,7 @@ def test_scheduler_routes_responses_to_chat_deployments_when_backend_supports_re
 def test_scheduler_holds_switch_during_grace_window() -> None:
     scheduler = SchedulerEngine(_config())
     created_at = (datetime.now(tz=UTC) - timedelta(seconds=30)).isoformat()
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -170,7 +187,7 @@ def test_scheduler_holds_switch_during_grace_window() -> None:
 def test_scheduler_switches_after_grace_window_expires() -> None:
     scheduler = SchedulerEngine(_config())
     created_at = (datetime.now(tz=UTC) - timedelta(seconds=360)).isoformat()
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -211,7 +228,7 @@ def test_scheduler_allows_swap_when_eviction_reclaims_group_budget() -> None:
     config.deployments["dep-a"].memory_fraction = 0.9
     config.deployments["dep-b"].memory_fraction = 0.9
     scheduler = SchedulerEngine(config)
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -238,7 +255,7 @@ def test_scheduler_allows_swap_when_eviction_restores_free_memory_observation() 
     config.deployments["dep-a"].memory_fraction = 0.7
     config.deployments["dep-b"].memory_fraction = 0.7
     scheduler = SchedulerEngine(config)
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -296,7 +313,7 @@ def test_scheduler_prefers_first_eligible_group_for_multigroup_deployment() -> N
     scheduler = SchedulerEngine(config)
     decision = scheduler.schedule(
         SchedulingRequest("gamma", "chat", 100, "interactive", "req-5"),
-        RuntimeStateSnapshot(),
+        _observed_snapshot(),
         datetime.now(tz=UTC),
     )
     assert decision.accepted is True
@@ -331,7 +348,7 @@ def test_scheduler_falls_back_to_next_group_when_preferred_group_is_busy() -> No
         memory_fraction=0.4,
         tasks=["chat"],
     )
-    snapshot = RuntimeStateSnapshot(
+    snapshot = _observed_snapshot(
         deployments={
             "dep-a": DeploymentRuntimeState(
                 deployment_id="dep-a",
@@ -368,7 +385,7 @@ def test_scheduler_filters_candidates_by_required_modality_capability() -> None:
             request_id="req-audio-1",
             required_capability="audio",
         ),
-        RuntimeStateSnapshot(),
+        _observed_snapshot(),
         datetime.now(tz=UTC),
     )
     assert decision.accepted is False
@@ -387,8 +404,60 @@ def test_scheduler_filters_candidates_by_required_modality_capability() -> None:
             request_id="req-audio-2",
             required_capability="audio",
         ),
-        RuntimeStateSnapshot(),
+        _observed_snapshot(),
         datetime.now(tz=UTC),
     )
     assert decision.accepted is True
     assert decision.deployment_id == "dep-a"
+
+
+@pytest.mark.parametrize("request_class", ["interactive", "batch", "manual"])
+@pytest.mark.parametrize("loaded", [False, True])
+def test_scheduler_rejects_missing_gpu_even_for_loaded_deployments(request_class, loaded) -> None:
+    config = _config()
+    # Partial observations are also insufficient for a multi-device group.
+    config.gpu_devices["gpu1"] = GPUDeviceConfig(id="gpu1")
+    config.gpu_groups["group-1"].gpu_ids.append("gpu1")
+    snapshot = RuntimeStateSnapshot(
+        gpu_observations={
+            "gpu0": GPUObservation(gpu_id="gpu0", free_memory_mb=1000, total_memory_mb=1000)
+        },
+        deployments={
+            "dep-a": DeploymentRuntimeState(
+                deployment_id="dep-a",
+                backend_runtime_id="backend-a",
+                gpu_group_id="group-1",
+                loaded=loaded,
+            )
+        },
+    )
+    decision = SchedulerEngine(config).schedule(
+        SchedulingRequest("alpha", "chat", 100, request_class, "req-missing"),
+        snapshot,
+        datetime.now(tz=UTC),
+    )
+    assert not decision.accepted
+    assert "unavailable GPUs" in decision.reason
+    assert "group-1: gpu1" in decision.reason
+    assert decision.gpu_group_id is None
+
+
+def test_scheduler_only_uses_explicitly_eligible_available_groups() -> None:
+    config = _config()
+    config.gpu_devices["gpu1"] = GPUDeviceConfig(id="gpu1")
+    config.gpu_groups["group-2"] = GPUGroupConfig(id="group-2", display_name="B", gpu_ids=["gpu1"])
+    config.deployments["dep-a"].gpu_group_ids = ["group-1", "group-2"]
+    snapshot = _observed_snapshot()
+    del snapshot.gpu_observations["gpu0"]
+    scheduler = SchedulerEngine(config)
+    request = SchedulingRequest("alpha", "chat", 100, "manual", "req-fallback")
+    decision = scheduler.schedule(request, snapshot, datetime.now(tz=UTC))
+    assert decision.accepted
+    assert decision.gpu_group_id == "group-2"
+    request.target_gpu_group_id = "group-1"
+    pinned = scheduler.schedule(request, snapshot, datetime.now(tz=UTC))
+    assert not pinned.accepted
+    assert "group-1: gpu0" in pinned.reason
+    config.deployments["dep-a"].gpu_group_ids = ["group-1"]
+    request.target_gpu_group_id = None
+    assert not scheduler.schedule(request, snapshot, datetime.now(tz=UTC)).accepted

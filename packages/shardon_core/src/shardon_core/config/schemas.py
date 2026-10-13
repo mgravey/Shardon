@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class GlobalConfig(BaseModel):
     instance_name: str = "shardon"
+    gpu_provider: Literal["nvidia-smi", "mock"] = "nvidia-smi"
     admin_host: str = "127.0.0.1"
     admin_port: int = 8081
     router_host: str = "127.0.0.1"

@@ -29,7 +29,7 @@ from shardon_core.backends.registry import BackendRegistry
 from shardon_core.config.loader import load_repository_config
 from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig
 from shardon_core.config.writer import delete_yaml, ensure_symlink, write_yaml
-from shardon_core.gpu.provider import GPUProvider, NvidiaSMIProvider
+from shardon_core.gpu.provider import GPUProvider, MockGPUProvider, NvidiaSMIProvider
 from shardon_core.logging.events import EventLogger
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingDecision, SchedulingRequest
 from shardon_core.services.observability import StreamUsage, TokenUsage, UsageStore, extract_usage
@@ -74,7 +74,11 @@ class ShardonRuntime:
             state_root=self.state_root,
             event_logger=self.event_logger,
         )
-        self.gpu_provider = gpu_provider or NvidiaSMIProvider()
+        self.gpu_provider = gpu_provider or (
+            MockGPUProvider()
+            if self.config.global_config.gpu_provider == "mock"
+            else NvidiaSMIProvider()
+        )
         self.scheduler = SchedulerEngine(self.config)
         self.backends = BackendRegistry(self.config, self.state_root, self.event_logger)
         self._deployment_locks: dict[str, asyncio.Lock] = {}
@@ -147,7 +151,7 @@ class ShardonRuntime:
         log_path = self.state_root / "logs" / f"{deployment_id}.log"
         if not log_path.exists():
             return []
-        lines = log_path.read_text(encoding="utf-8").splitlines()
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         return lines[-tail_lines:]
 
     def read_events(self, tail_lines: int = 200) -> list[str]:
@@ -195,6 +199,9 @@ class ShardonRuntime:
 
         def mutate(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
             snapshot = self._seed_snapshot(snapshot)
+            # Each probe is a complete inventory; disappeared devices must not
+            # retain stale memory observations from a previous successful probe.
+            snapshot.gpu_observations = {}
             for gpu_id, observation in observations.items():
                 snapshot.gpu_observations[gpu_id] = observation.model_copy(
                     update={
@@ -527,15 +534,19 @@ class ShardonRuntime:
                 },
                 status_code=409,
             )
-        snapshot = self.snapshot()
+        snapshot = self.refresh_gpu_observations()
         runtime_state = snapshot.deployments.get(deployment.id)
         selected_gpu_group_id = (
             (runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id)
             if runtime_state is not None
             else None
         )
-        if runtime_state is not None and runtime_state.loaded and (
-            gpu_group_id is None or gpu_group_id == selected_gpu_group_id
+        if (
+            runtime_state is not None
+            and runtime_state.loaded
+            and selected_gpu_group_id is not None
+            and (gpu_group_id is None or gpu_group_id == selected_gpu_group_id)
+            and not self.scheduler.unavailable_gpu_ids(selected_gpu_group_id, snapshot)
         ):
             return {
                 "status": "ok",
@@ -2032,6 +2043,18 @@ class ShardonRuntime:
             == selected_gpu_group_id
         ):
             return
+        if current is not None and current.loaded:
+            # Another load may have completed while this caller waited for the
+            # lifecycle lock. Never relabel/reuse that process for another group.
+            raise RuntimeOperationError(
+                "deployment placement changed after scheduling",
+                detail={
+                    "error": "deployment placement changed after scheduling; retry scheduling",
+                    "deployment_id": deployment.id,
+                    "requested_gpu_group_id": selected_gpu_group_id,
+                    "selected_gpu_group_id": current.selected_gpu_group_id or current.gpu_group_id,
+                },
+            )
         self.state_store.mutate(
             lambda state: self._mark_starting(
                 state,
@@ -2041,6 +2064,19 @@ class ShardonRuntime:
             )
         )
         try:
+            # Recheck after scheduling (and on recovery) before spawning. The
+            # selected group stays fixed if its devices disappear in between.
+            snapshot = self.refresh_gpu_observations()
+            missing = self.scheduler.unavailable_gpu_ids(selected_gpu_group_id, snapshot)
+            if missing:
+                detail = {
+                    "error": f"unavailable GPUs (missing observations): {', '.join(missing)}",
+                    "deployment_id": deployment.id,
+                    "gpu_group_id": selected_gpu_group_id,
+                    "unavailable_gpu_ids": missing,
+                }
+                self.event_logger.emit("backend.start_failed", "GPU preflight failed", **detail)
+                raise BackendOperationError("GPU preflight failed", detail=detail)
             readiness = await self.backends.ensure_started_and_ready(
                 deployment,
                 gpu_group_id=selected_gpu_group_id,
@@ -2674,6 +2710,7 @@ class ShardonRuntime:
         drain = snapshot.drains.get(gpu_group_id)
         return {
             "gpu_group_id": gpu_group_id,
+            "unavailable_gpu_ids": self.scheduler.unavailable_gpu_ids(gpu_group_id, snapshot),
             "keep_free": group.keep_free,
             "loaded_deployments": loaded_deployments,
             "drain_status": drain.status if drain is not None else None,

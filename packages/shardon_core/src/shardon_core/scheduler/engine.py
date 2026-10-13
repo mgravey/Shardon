@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal
 
 from shardon_core.config.schemas import DeploymentConfig, GPUGroupConfig, RepositoryConfig
-from shardon_core.state.models import ActiveRequest, RuntimeStateSnapshot
+from shardon_core.state.models import RuntimeStateSnapshot
 
 
 @dataclass(slots=True)
@@ -50,7 +50,14 @@ class SchedulerEngine:
         loaded_candidates = [
             deployment
             for deployment in candidates
-            if snapshot.deployments.get(deployment.id, None) and snapshot.deployments[deployment.id].loaded
+            if snapshot.deployments.get(deployment.id, None)
+            and snapshot.deployments[deployment.id].loaded
+            and not self.unavailable_gpu_ids(
+                self._deployment_selected_group(
+                    deployment.id, snapshot, default=deployment.preferred_gpu_group_id()
+                ),
+                snapshot,
+            )
         ]
         if request.request_class == "batch":
             loaded_batch = self._pick_best_loaded(loaded_candidates, snapshot)
@@ -60,7 +67,10 @@ class SchedulerEngine:
                     snapshot,
                     default=loaded_batch.preferred_gpu_group_id(),
                 )
-                if request.target_gpu_group_id is None or request.target_gpu_group_id == loaded_group:
+                if (
+                    request.target_gpu_group_id is None
+                    or request.target_gpu_group_id == loaded_group
+                ):
                     return SchedulingDecision(
                         True,
                         loaded_batch.id,
@@ -91,6 +101,7 @@ class SchedulerEngine:
                     "reusing loaded deployment",
                 )
 
+        unavailable_groups: dict[str, list[str]] = {}
         for deployment in candidates:
             deployment_state = snapshot.deployments.get(deployment.id)
             group_candidates = (
@@ -105,11 +116,19 @@ class SchedulerEngine:
                     continue
                 if gpu_group_id not in self.config.gpu_groups:
                     continue
+                missing = self.unavailable_gpu_ids(gpu_group_id, snapshot)
+                if missing:
+                    unavailable_groups[gpu_group_id] = missing
+                    continue
                 if self._group_is_draining(gpu_group_id, snapshot):
                     continue
                 loaded_here = self._loaded_in_group(gpu_group_id, snapshot)
                 self_evict = self._self_evict_if_needed(deployment.id, gpu_group_id, snapshot)
-                if self_evict and deployment_state is not None and deployment_state.active_request_ids:
+                if (
+                    self_evict
+                    and deployment_state is not None
+                    and deployment_state.active_request_ids
+                ):
                     continue
                 assumed_evictions = self._dedupe_ids([*loaded_here, *self_evict])
                 busy_evictions = [
@@ -121,15 +140,12 @@ class SchedulerEngine:
                 ]
                 if busy_evictions:
                     continue
-                can_switch = (
-                    not loaded_here
-                    or self._can_switch(
-                        gpu_group_id,
-                        request.priority,
-                        snapshot,
-                        now,
-                        bypass_grace_window=request.request_class == "manual",
-                    )
+                can_switch = not loaded_here or self._can_switch(
+                    gpu_group_id,
+                    request.priority,
+                    snapshot,
+                    now,
+                    bypass_grace_window=request.request_class == "manual",
                 )
                 if request.request_class == "batch" and loaded_here:
                     continue
@@ -153,7 +169,20 @@ class SchedulerEngine:
                     should_load=True,
                     should_evict=assumed_evictions,
                 )
-        return SchedulingDecision(False, None, None, None, 409, "no deployment currently admissible")
+        reason = "no deployment currently admissible"
+        if unavailable_groups:
+            reason += "; unavailable GPUs (missing observations): " + "; ".join(
+                f"{group_id}: {', '.join(gpu_ids)}"
+                for group_id, gpu_ids in unavailable_groups.items()
+            )
+        return SchedulingDecision(False, None, None, None, 409, reason)
+
+    def unavailable_gpu_ids(self, gpu_group_id: str, snapshot: RuntimeStateSnapshot) -> list[str]:
+        return [
+            gpu_id
+            for gpu_id in self.config.gpu_groups[gpu_group_id].gpu_ids
+            if gpu_id not in snapshot.gpu_observations
+        ]
 
     def _matching_deployments(self, request: SchedulingRequest) -> list[DeploymentConfig]:
         if request.deployment_id is not None:
@@ -214,7 +243,11 @@ class SchedulerEngine:
         return sorted(
             candidates,
             key=lambda item: (
-                len(snapshot.deployments.get(item.id, None).active_request_ids if snapshot.deployments.get(item.id) else []),
+                len(
+                    snapshot.deployments.get(item.id, None).active_request_ids
+                    if snapshot.deployments.get(item.id)
+                    else []
+                ),
                 snapshot.deployments.get(item.id).last_used_at or "",
             ),
         )[0]
@@ -292,7 +325,7 @@ class SchedulerEngine:
             return False
         for observation in observation_totals:
             if observation is None:
-                continue
+                return False
             free_fraction = observation.free_memory_mb / max(observation.total_memory_mb, 1)
             effective_free_fraction = min(1.0, free_fraction + reclaimable_fraction)
             if effective_free_fraction < (1 - deployment_memory_fraction) * 0.5:
@@ -329,5 +362,7 @@ class SchedulerEngine:
         oldest_timestamp = datetime.fromisoformat(oldest.created_at)
         if (now - oldest_timestamp).total_seconds() < self.grace_window_seconds:
             return False
-        lower_or_equal = [request for request in queued_for_group if request.priority <= incoming_priority]
+        lower_or_equal = [
+            request for request in queued_for_group if request.priority <= incoming_priority
+        ]
         return bool(lower_or_equal)

@@ -79,3 +79,8 @@ A connection timeout can still trigger the existing single recovery attempt.
 - `HF_TOKEN` is the intended place for Hugging Face download access.
 - `HF_HOME` can be set to control the Hugging Face cache location.
 - These values are intentionally kept out of the admin config and out of persisted runtime state.
+
+GPU identities and runtime settings are supplied by deployment-local configuration;
+see [GPU mapping](gpu-mapping.md) for placeholders, per-group CUDA selection,
+explicit environment precedence, availability checks, and isolation limits.
+Inventory does not automatically configure a backend's CUDA environment.

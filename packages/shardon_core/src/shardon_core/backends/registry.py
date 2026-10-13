@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 from shardon_core.backends.base import (
     BackendAdapter,
@@ -18,12 +17,16 @@ from shardon_core.utils.time import utc_now_iso
 
 
 class BackendRegistry:
-    def __init__(self, config: RepositoryConfig, state_root: Path, event_logger: EventLogger) -> None:
+    def __init__(
+        self, config: RepositoryConfig, state_root: Path, event_logger: EventLogger
+    ) -> None:
         self.config = config
         self.event_logger = event_logger
         self.supervisor = ProcessSupervisor(state_root)
 
-    def resolve_backend(self, backend_runtime_id: str, *, gpu_group_id: str | None = None) -> BackendRuntimeConfig:
+    def resolve_backend(
+        self, backend_runtime_id: str, *, gpu_group_id: str | None = None
+    ) -> BackendRuntimeConfig:
         backend = self.config.backends[backend_runtime_id]
         return backend.resolved_for_gpu_group(gpu_group_id)
 
@@ -49,19 +52,32 @@ class BackendRegistry:
             )
         launch_command = [*backend.launch_command, *runtime_launch_args]
         backend_to_start = backend.model_copy(update={"launch_command": launch_command})
-        managed = self.supervisor.start(
-            backend=backend_to_start,
-            deployment=deployment,
-            extra_env={
-                "SHARDON_DEPLOYMENT_ID": deployment.id,
-                "SHARDON_MODEL_ID": deployment.model_id,
-                "SHARDON_MODEL_SOURCE": model.source if model is not None else "",
-                "SHARDON_MODEL_DISPLAY_NAME": model.display_name if model is not None else deployment.display_name,
-                "SHARDON_API_MODEL_NAME": deployment.api_model_name,
-                "SHARDON_GPU_GROUP_ID": gpu_group_id,
-                "SHARDON_MODEL_RUNTIME_LAUNCH_ARGS": " ".join(runtime_launch_args),
-            },
-        )
+        try:
+            managed = self.supervisor.start(
+                backend=backend_to_start,
+                deployment=deployment,
+                extra_env={
+                    "SHARDON_DEPLOYMENT_ID": deployment.id,
+                    "SHARDON_MODEL_ID": deployment.model_id,
+                    "SHARDON_MODEL_SOURCE": model.source if model is not None else "",
+                    "SHARDON_MODEL_DISPLAY_NAME": model.display_name
+                    if model is not None
+                    else deployment.display_name,
+                    "SHARDON_API_MODEL_NAME": deployment.api_model_name,
+                    "SHARDON_GPU_GROUP_ID": gpu_group_id,
+                    "SHARDON_MODEL_RUNTIME_LAUNCH_ARGS": " ".join(runtime_launch_args),
+                },
+            )
+        except (OSError, ValueError) as exc:
+            detail = {
+                "deployment_id": deployment.id,
+                "backend_runtime_id": deployment.backend_runtime_id,
+                "gpu_group_id": gpu_group_id,
+                "log_path": str(self.supervisor.state_root / "logs" / f"{deployment.id}.log"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self.event_logger.emit("backend.start_failed", "backend launch failed", **detail)
+            raise BackendOperationError("backend launch failed", detail=detail) from exc
         self.event_logger.emit(
             "backend.start",
             "started backend runtime",
@@ -88,6 +104,7 @@ class BackendRegistry:
             or self.config.global_config.backend_readiness_poll_interval_seconds
         )
         pid = self.ensure_started(deployment, gpu_group_id=gpu_group_id)
+        managed = self.supervisor.processes.get(deployment.id)
         start_monotonic = asyncio.get_event_loop().time()
         last_error = "backend did not report readiness"
         attempt_count = 0
@@ -130,8 +147,12 @@ class BackendRegistry:
                 )
                 return detail
             except Exception as exc:
-                last_error = str(exc)
+                last_error = f"{type(exc).__name__}: {exc}"
                 await asyncio.sleep(poll_interval_seconds)
+        # Capture the natural exit status before cleanup removes the process or
+        # kills one that timed out. Adopted processes may have no exit status.
+        returncode = managed.process.poll() if managed and managed.process else None
+        log_path = self.supervisor.state_root / "logs" / f"{deployment.id}.log"
         self.stop(deployment.id, gpu_group_id=gpu_group_id, force=True)
         detail = {
             "deployment_id": deployment.id,
@@ -141,6 +162,8 @@ class BackendRegistry:
             "timeout_seconds": timeout_seconds,
             "attempt_count": attempt_count,
             "error": last_error,
+            "returncode": returncode,
+            "log_path": str(log_path),
         }
         self.event_logger.emit(
             "backend.readiness_failed",
