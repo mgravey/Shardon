@@ -1,5 +1,9 @@
 # Activity and usage
 
+Open the UI without signing in to view activity and the leaderboard. **Admin sign in**
+opens the protected configuration controls after authentication. Signing out returns
+to the public dashboard.
+
 The dashboard header displays currently loaded model names in large type, with
 GPU placement. It refreshes every two seconds independently of activity filters.
 Multiple loaded models are all listed; an empty runtime shows “No model loaded,”
@@ -18,9 +22,13 @@ items exclude completed, failed, cancelled, and the current in-flight item.
 Queue clearing cancels waiting requests and optionally queued batch items without
 cancelling requests already dispatched to backends.
 
-## Admin endpoints
+## Public read-only endpoints
 
-Both endpoints require an admin bearer token. They read persisted state and do
+Both endpoints are accessible without a bearer token on the admin API service
+(and through the UI’s `/api` proxy). They expose owner names, key IDs, request IDs,
+model placement, and usage totals; they never expose key secrets or request content.
+Configuration, key management, logs, and runtime actions remain admin-authenticated.
+These endpoints read persisted state and do
 not run health checks, scheduling, or GPU enforcement.
 
 - `GET /runtime/activity?model=demo-chat&api_key=my-key&user=alice`

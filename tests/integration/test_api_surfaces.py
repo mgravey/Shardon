@@ -481,7 +481,7 @@ def test_chat_route_forwards_output_and_reasoning_options(tmp_path: Path, monkey
         assert captured[-1]["reasoning_effort"] == effort
 
 
-def test_activity_and_usage_are_admin_only_filtered_and_read_only(tmp_path, monkeypatch):
+def test_activity_and_usage_are_public_filtered_and_read_only(tmp_path, monkeypatch):
     from shardon_admin_api.main import create_app
     from shardon_core.services.observability import TokenUsage
     from shardon_core.state.models import ActiveRequest
@@ -531,26 +531,40 @@ def test_activity_and_usage_are_admin_only_filtered_and_read_only(tmp_path, monk
         monkeypatch.setattr(runtime, name, forbidden_side_effect)
     monkeypatch.setattr(runtime.state_store, "mutate", forbidden_side_effect)
     before = runtime.state_store.snapshot_path.read_bytes()
+    # Public observability must not grant configuration or runtime control access.
+    for method, path in (
+        ("GET", "/resources"),
+        ("GET", "/api-keys"),
+        ("GET", "/runtime/status"),
+        ("GET", "/runtime/environment"),
+        ("POST", "/runtime/load/chat-a"),
+        ("POST", "/runtime/unload/chat-a"),
+        ("DELETE", "/resources/models/chat"),
+    ):
+        assert client.request(method, path).status_code == 401
+        assert client.request(
+            method, path, headers={"Authorization": f"Bearer {api_secret}"}
+        ).status_code == 401
     for path in ("/runtime/activity", "/runtime/usage"):
-        assert client.get(path).status_code == 401
+        assert client.get(path).status_code == 200
         assert (
-            client.get(path, headers={"Authorization": f"Bearer {api_secret}"}).status_code == 401
+            client.get(path, headers={"Authorization": f"Bearer {api_secret}"}).status_code == 200
         )
         assert client.get(path, headers=headers).status_code == 200
     activity = client.get(
-        "/runtime/activity?api_key=old-key&user=alice&model=demo-chat", headers=headers
+        "/runtime/activity?api_key=old-key&user=alice&model=demo-chat"
     ).json()
     assert activity["waiting"] == 1
-    assert client.get("/runtime/activity?user=bob", headers=headers).json()["waiting"] == 0
-    usage = client.get("/runtime/usage?group_by=user&api_key=old-key", headers=headers).json()
+    assert client.get("/runtime/activity?user=bob").json()["waiting"] == 0
+    usage = client.get("/runtime/usage?group_by=user&api_key=old-key").json()
     assert usage["rows"][0]["identity"] == "alice"
     assert usage["totals"]["total_tokens"] == 10
-    assert client.get("/runtime/usage?period=bad", headers=headers).status_code == 422
-    assert client.get("/runtime/usage?group_by=bad", headers=headers).status_code == 422
+    assert client.get("/runtime/usage?period=bad").status_code == 422
+    assert client.get("/runtime/usage?group_by=bad").status_code == 422
     requested = client.get(
-        "/runtime/usage?model_view=requested&model=demo-chat", headers=headers,
+        "/runtime/usage?model_view=requested&model=demo-chat",
     ).json()
     assert requested["model_view"] == "requested"
     assert requested["totals"]["total_tokens"] == 10
-    assert client.get("/runtime/usage?model_view=invalid", headers=headers).status_code == 422
+    assert client.get("/runtime/usage?model_view=invalid").status_code == 422
     assert runtime.state_store.snapshot_path.read_bytes() == before

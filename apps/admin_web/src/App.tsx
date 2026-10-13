@@ -84,6 +84,7 @@ async function api<T>(path: string, token: string, init?: RequestInit): Promise<
 
 export default function App() {
   const [token, setToken] = useState<string>(() => localStorage.getItem("shardon_admin_token") ?? "");
+  const [showAdminLogin, setShowAdminLogin] = useState(false);
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("admin");
   const [resources, setResources] = useState<ResourceData | null>(null);
@@ -377,10 +378,19 @@ export default function App() {
 
   if (!token) {
     return (
-      <main className="shell shell-login">
-        <section className="login-card">
+      <main className="shell">
+        <header className="hero">
+          <LoadedModelsBanner />
+          <div className="hero-actions">
+            <button className="secondary" aria-expanded={showAdminLogin}
+              aria-controls="admin-login" onClick={() => setShowAdminLogin(value => !value)}>
+              {showAdminLogin ? "Close admin sign in" : "Admin sign in"}
+            </button>
+          </div>
+        </header>
+        {showAdminLogin && <section className="login-card" id="admin-login">
           <p className="eyebrow">Shardon</p>
-          <h1>Pardon, one model at a time.</h1>
+          <h2>Admin sign in</h2>
           <p className="lede">Sign in to the control plane and manage deployments, queues, drains, keys, and runtime health.</p>
           <form onSubmit={login} className="login-form">
             <label>
@@ -394,7 +404,8 @@ export default function App() {
             <button type="submit">Sign In</button>
           </form>
           <p className="message">{message}</p>
-        </section>
+        </section>}
+        <ActivityBoard />
       </main>
     );
   }
@@ -452,7 +463,7 @@ export default function App() {
   return (
     <main className="shell">
       <header className="hero">
-        <LoadedModelsBanner token={token} />
+        <LoadedModelsBanner />
         <div className="hero-actions">
           <button onClick={() => refresh().catch((error: Error) => setMessage(error.message))}>Refresh</button>
           <button
@@ -460,6 +471,8 @@ export default function App() {
             onClick={() => {
               localStorage.removeItem("shardon_admin_token");
               setToken("");
+              setShowAdminLogin(false);
+              setMessage("");
             }}
           >
             Sign Out
@@ -469,7 +482,7 @@ export default function App() {
 
       <section className="message-bar">{message}</section>
 
-      <ActivityBoard token={token} />
+      <ActivityBoard />
 
       <section className="dashboard-grid">
         <article className="panel">

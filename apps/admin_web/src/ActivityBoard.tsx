@@ -31,7 +31,7 @@ type Usage = {
   }>;
 };
 
-function usePolling<T>(path: string, token: string, interval: number) {
+function usePolling<T>(path: string, interval: number) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState("");
   const [updated, setUpdated] = useState<Date | null>(null);
@@ -46,7 +46,7 @@ function usePolling<T>(path: string, token: string, interval: number) {
       busy = true;
       try {
         const response = await fetch(`/api${path}`, {
-          headers: { Authorization: `Bearer ${token}` }, signal: controller.signal,
+          signal: controller.signal,
         });
         if (!response.ok) throw new Error(`Update failed (${response.status})`);
         const next = await response.json() as T;
@@ -65,7 +65,7 @@ function usePolling<T>(path: string, token: string, interval: number) {
       disposed = true; controller.abort(); window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refresh);
     };
-  }, [path, token, interval]);
+  }, [path, interval]);
   return { data, error, updated, refreshing };
 }
 
@@ -80,9 +80,9 @@ function Freshness({ error, updated, refreshing }: { error: string; updated: Dat
   </span>;
 }
 
-export function LoadedModelsBanner({ token }: { token: string }) {
+export function LoadedModelsBanner() {
   // Keep the global loaded-model display independent of the activity filters.
-  const activity = usePolling<Activity>("/runtime/activity", token, 2000);
+  const activity = usePolling<Activity>("/runtime/activity", 2000);
   const loaded = activity.data?.models.filter(model =>
     model.deployments.some(deployment => deployment.state === "ready"),
   ) ?? [];
@@ -90,7 +90,7 @@ export function LoadedModelsBanner({ token }: { token: string }) {
     model.deployments.some(deployment => deployment.state === "starting"),
   ) ?? [];
   return <div className="loaded-model-banner">
-    <p className="eyebrow">Shardon Admin · Currently loaded{loaded.length > 1 ? " models" : " model"}</p>
+    <p className="eyebrow">Shardon · Currently loaded{loaded.length > 1 ? " models" : " model"}</p>
     <h1 className="loaded-model-name">
       {loaded.length > 0 ? loaded.map(model => <span key={model.model_name}>{model.model_name}</span>)
         : !activity.data ? (activity.error ? "Model status unavailable" : "Checking loaded models…")
@@ -116,7 +116,7 @@ function UsageCells({ row }: { row: Totals }) {
     </td></>;
 }
 
-export default function ActivityBoard({ token }: { token: string }) {
+export default function ActivityBoard() {
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [user, setUser] = useState("");
@@ -127,8 +127,8 @@ export default function ActivityBoard({ token }: { token: string }) {
   if (model.trim()) filters.set("model", model.trim());
   if (apiKey.trim()) filters.set("api_key", apiKey.trim());
   if (user.trim()) filters.set("user", user.trim());
-  const activity = usePolling<Activity>(`/runtime/activity?${filters}`, token, 2000);
-  const usage = usePolling<Usage>(`/runtime/usage?${filters}&period=${period}&group_by=${groupBy}&model_view=${modelView}`, token, 30000);
+  const activity = usePolling<Activity>(`/runtime/activity?${filters}`, 2000);
+  const usage = usePolling<Usage>(`/runtime/usage?${filters}&period=${period}&group_by=${groupBy}&model_view=${modelView}`, 30000);
   const filtered = Boolean(model || apiKey || user);
   return <div className="observability">
     <section className="panel activity-panel" aria-labelledby="activity-title">

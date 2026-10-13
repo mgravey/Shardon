@@ -1,7 +1,10 @@
 # Installation and operations
 
 Start with [Install and First Run in the README](../README.md#install-and-first-run)
-for prerequisites, a fresh checkout, login, key creation, and the first request.
+for prerequisites, a fresh checkout, key creation, and the first request.
+The UI opens directly onto public activity and usage statistics without a login.
+Select **Admin sign in** to access configuration and key management. Public statistics
+include owner names and key IDs; the admin password protects administrative controls.
 This guide covers machine-specific configuration and ongoing operation.
 All relative commands below assume you are in the repository root.
 
@@ -338,7 +341,7 @@ models rather than assuming restored JSON means inference is ready.
 | Backend exits or uses the wrong GPU | Verify executable permissions, environment, `CUDA_VISIBLE_DEVICES`, port availability, and engine/CUDA compatibility. |
 | Hugging Face download fails | Check token access, model approval, network, and writable absolute cache path. |
 | Token counts say Unavailable | Backend did not report usage; this is normal for bundled mocks and some audio/streaming responses. |
-| Dashboard shows Stale | Last good data is retained; check connectivity, admin token expiry, and API health. |
+| Dashboard shows Stale | Last good data is retained; check connectivity, the UI proxy, and API health; statistics need no login. |
 | Port already in use | Check API/UI configuration and backend launch ports; avoid manually starting a second copy. |
 
 The default queue/startup timeouts are 600 seconds with the shipped configuration.

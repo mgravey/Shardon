@@ -113,7 +113,9 @@ is also available directly as `./scripts/run-local.sh`.
 | Admin API | <http://127.0.0.1:8081> | Control plane; API documentation at `/docs`. |
 | Router API | <http://127.0.0.1:8080> | Inference plane; OpenAI client base URL ends in `/v1`. |
 
-Open the UI and sign in with the demo credentials **`admin` / `admin`**.
+Open the UI to view loaded models, live activity, and the usage leaderboard without
+signing in. To manage configuration or API keys, select **Admin sign in** and use
+the demo credentials **`admin` / `admin`**.
 [Set your own admin password](docs/installation.md#admin-password) before sharing
 access. No inference API key is pre-created.
 
@@ -164,6 +166,8 @@ requests grouped under `currently-loaded`.
 
 The bundled mock replies do not report token usage or provide real SSE streaming:
 request counts work, while token counts show **Unavailable**. This is expected.
+Public statistics include owner names and key IDs, never key secrets. Configuration
+and runtime controls still require admin authentication.
 See [Activity and usage](docs/activity-and-usage.md) for coverage, history, and
 streaming accounting details.
 
@@ -275,7 +279,7 @@ Live router smoke test:
 
 ## Live Activity and Token Usage
 
-The admin dashboard prominently names every currently loaded model at the top,
+The public dashboard (no login required) prominently names every currently loaded model at the top,
 with GPU placement and automatic refresh, even when activity filters are applied.
 Below it, the live activity board shows requests by model,
 API key, and owner. It distinguishes waiting, model loading, and backend in-flight
@@ -290,4 +294,6 @@ statistics between the actual model used and the requested name (including
 missing counts are shown as unavailable, with coverage indicating partial totals.
 History is stored under `state/usage/`, survives restarts and key revocation, and
 contains no prompts, responses, or API secrets. Tracking begins with this version.
+Public statistics include owner names and key IDs, never key secrets. Configuration
+and runtime controls still require admin authentication.
 See [Activity and usage](docs/activity-and-usage.md) for API details and limitations.

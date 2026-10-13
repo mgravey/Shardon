@@ -283,7 +283,6 @@ def create_app() -> FastAPI:
         model: str | None = None,
         api_key: str | None = None,
         user: str | None = None,
-        admin_identity: str = Depends(admin_user),
         runtime: ShardonRuntime = Depends(get_runtime),
     ) -> ActivityResponse:
         return activity_snapshot(
@@ -302,7 +301,6 @@ def create_app() -> FastAPI:
         model: str | None = None,
         api_key: str | None = None,
         user: str | None = None,
-        admin_identity: str = Depends(admin_user),
         runtime: ShardonRuntime = Depends(get_runtime),
     ) -> UsageResponse:
         return runtime.usage_store.summary(

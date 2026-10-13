@@ -215,7 +215,7 @@ core.*
 node_modules/
 *.tsbuildinfo
 state/usage/
-# Local browser verification artifacts (activity board and loaded-model banner).
+# Local browser verification artifacts (public dashboard, admin login, loaded-model banner).
 .playwright-cli/
 output/playwright/
 
