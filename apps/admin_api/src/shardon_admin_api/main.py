@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-
 from shardon_core.api.schemas import (
-    APIKeySecretResponse,
     AdminLoginRequest,
     AdminLoginResponse,
+    APIKeySecretResponse,
     ClearQueueRequest,
     CreateAPIKeyRequest,
     DrainRequest,
@@ -19,8 +18,19 @@ from shardon_core.api.schemas import (
     ModelOnboardingRequest,
     RuntimeLoadRequest,
 )
-from shardon_core.config.schemas import BackendRuntimeConfig, DeploymentConfig, GPUDeviceConfig, GPUGroupConfig, ModelConfig
+from shardon_core.config.schemas import (
+    BackendRuntimeConfig,
+    DeploymentConfig,
+    GPUDeviceConfig,
+    GPUGroupConfig,
+    ModelConfig,
+)
 from shardon_core.services.container import build_container
+from shardon_core.services.observability import (
+    ActivityResponse,
+    UsageResponse,
+    activity_snapshot,
+)
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.utils.env import load_dotenv_file
 
@@ -267,6 +277,42 @@ def create_app() -> FastAPI:
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
         return runtime.status()
+
+    @app.get("/runtime/activity", response_model=ActivityResponse)
+    def runtime_activity(
+        model: str | None = None,
+        api_key: str | None = None,
+        user: str | None = None,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> ActivityResponse:
+        return activity_snapshot(
+            runtime.state_store.load(),
+            runtime.config,
+            model=model,
+            api_key=api_key,
+            user=user,
+        )
+
+    @app.get("/runtime/usage", response_model=UsageResponse)
+    def runtime_usage(
+        period: Literal["today", "7d", "30d"] = "today",
+        group_by: Literal["api_key", "user"] = "api_key",
+        model_view: Literal["actual", "requested"] = "actual",
+        model: str | None = None,
+        api_key: str | None = None,
+        user: str | None = None,
+        admin_identity: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> UsageResponse:
+        return runtime.usage_store.summary(
+            period=period,
+            group_by=group_by,
+            model_view=model_view,
+            model=model,
+            api_key=api_key,
+            user=user,
+        )
 
     @app.get("/runtime/environment", response_model=EnvironmentStatusResponse)
     async def runtime_environment(

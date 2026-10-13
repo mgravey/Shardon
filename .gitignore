@@ -210,3 +210,15 @@ bootstrap.log
 # Backend crashes may leave native runtime core dumps in the repository working tree.
 core
 core.*
+
+# Admin dashboard dependencies/build metadata and local usage accounting (actual/requested models).
+node_modules/
+*.tsbuildinfo
+state/usage/
+# Local browser verification artifacts (activity board and loaded-model banner).
+.playwright-cli/
+output/playwright/
+
+# Local installation backups and locks used when updating admin credentials.
+/backups/
+config/auth/**/*.lock

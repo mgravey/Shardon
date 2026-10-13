@@ -479,3 +479,78 @@ def test_chat_route_forwards_output_and_reasoning_options(tmp_path: Path, monkey
         assert response.status_code == 200, response.text
         assert captured[-1]["response_format"] == response_format
         assert captured[-1]["reasoning_effort"] == effort
+
+
+def test_activity_and_usage_are_admin_only_filtered_and_read_only(tmp_path, monkeypatch):
+    from shardon_admin_api.main import create_app
+    from shardon_core.services.observability import TokenUsage
+    from shardon_core.state.models import ActiveRequest
+    from shardon_core.utils.time import utc_now_iso
+
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+    app = create_app()
+    client = TestClient(app)
+    runtime = app.state.runtime
+    token = client.post("/auth/login", json={"username": "admin", "password": "admin"}).json()[
+        "access_token"
+    ]
+    headers = {"Authorization": f"Bearer {token}"}
+    item = ActiveRequest(
+        id="test-activity",
+        api_key_id="old-key",
+        user_name="alice",
+        model_name="demo-chat",
+        deployment_id="",
+        backend_runtime_id="",
+        gpu_group_id="",
+        request_class="interactive",
+        status="queued",
+        priority=100,
+        created_at=utc_now_iso(),
+    )
+    runtime.state_store.mutate(lambda s: s.model_copy(update={"queued_requests": [item]}))
+    runtime.usage_store.record(item, "completed", TokenUsage(total_tokens=10))
+    _, api_secret = runtime.api_keys.create_key(
+        key_id="inference-key",
+        user_name="bob",
+        priority=100,
+        permissions=["inference"],
+        actor="admin",
+    )
+
+    def forbidden_side_effect(*args, **kwargs):
+        raise AssertionError("read-only endpoint attempted a mutation or health check")
+
+    for name in (
+        "refresh_gpu_observations",
+        "enforce_keep_free",
+        "refresh_backend_health",
+        "snapshot",
+    ):
+        monkeypatch.setattr(runtime, name, forbidden_side_effect)
+    monkeypatch.setattr(runtime.state_store, "mutate", forbidden_side_effect)
+    before = runtime.state_store.snapshot_path.read_bytes()
+    for path in ("/runtime/activity", "/runtime/usage"):
+        assert client.get(path).status_code == 401
+        assert (
+            client.get(path, headers={"Authorization": f"Bearer {api_secret}"}).status_code == 401
+        )
+        assert client.get(path, headers=headers).status_code == 200
+    activity = client.get(
+        "/runtime/activity?api_key=old-key&user=alice&model=demo-chat", headers=headers
+    ).json()
+    assert activity["waiting"] == 1
+    assert client.get("/runtime/activity?user=bob", headers=headers).json()["waiting"] == 0
+    usage = client.get("/runtime/usage?group_by=user&api_key=old-key", headers=headers).json()
+    assert usage["rows"][0]["identity"] == "alice"
+    assert usage["totals"]["total_tokens"] == 10
+    assert client.get("/runtime/usage?period=bad", headers=headers).status_code == 422
+    assert client.get("/runtime/usage?group_by=bad", headers=headers).status_code == 422
+    requested = client.get(
+        "/runtime/usage?model_view=requested&model=demo-chat", headers=headers,
+    ).json()
+    assert requested["model_view"] == "requested"
+    assert requested["totals"]["total_tokens"] == 10
+    assert client.get("/runtime/usage?model_view=invalid", headers=headers).status_code == 422
+    assert runtime.state_store.snapshot_path.read_bytes() == before

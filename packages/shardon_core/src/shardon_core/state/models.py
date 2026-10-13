@@ -21,6 +21,11 @@ class ActiveRequest(BaseModel):
     finished_at: str | None = None
     error: str | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
+    task: str | None = None
+    requested_model_name: str | None = None
+    phase: Literal["waiting", "loading", "in_flight"] = "waiting"
+    wait_reason: str | None = None
+    batch_id: str | None = None
 
 
 class BatchJobState(BaseModel):
@@ -33,6 +38,9 @@ class BatchJobState(BaseModel):
     created_at: str
     updated_at: str
     total_items: int
+    gpu_group_id: str | None = None
+    current_item: int | None = None
+    cancelled_items: int = 0
     completed_items: int = 0
     failed_items: int = 0
     output_file_id: str | None = None

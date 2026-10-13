@@ -1,3 +1,4 @@
+import ActivityBoard, { LoadedModelsBanner } from "./ActivityBoard";
 import { FormEvent, startTransition, useEffect, useMemo, useState } from "react";
 
 type ResourceData = {
@@ -451,11 +452,7 @@ export default function App() {
   return (
     <main className="shell">
       <header className="hero">
-        <div>
-          <p className="eyebrow">Shardon Admin</p>
-          <h1>Operational control for constrained GPU routing.</h1>
-          <p className="lede">Separate control plane, file-backed desired state, live runtime visibility, and aggressive keep-free enforcement for shared hardware.</p>
-        </div>
+        <LoadedModelsBanner token={token} />
         <div className="hero-actions">
           <button onClick={() => refresh().catch((error: Error) => setMessage(error.message))}>Refresh</button>
           <button
@@ -472,29 +469,7 @@ export default function App() {
 
       <section className="message-bar">{message}</section>
 
-      <section className="metrics-grid">
-        <article className="metric-card">
-          <span>Queued</span>
-          <strong>{runtime?.queued_requests.length ?? 0}</strong>
-        </article>
-        <article className="metric-card">
-          <span>Active</span>
-          <strong>{Object.keys(runtime?.active_requests ?? {}).length}</strong>
-        </article>
-        <article className="metric-card">
-          <span>Batch Jobs</span>
-          <strong>{Object.keys(runtime?.batch_jobs ?? {}).length}</strong>
-        </article>
-        <article className="metric-card">
-          <span>Loaded Deployments</span>
-          <strong>
-            {
-              Object.values(runtime?.deployments ?? {}).filter((item) => (item as { loaded?: boolean }).loaded)
-                .length
-            }
-          </strong>
-        </article>
-      </section>
+      <ActivityBoard token={token} />
 
       <section className="dashboard-grid">
         <article className="panel">

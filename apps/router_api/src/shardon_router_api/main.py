@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -120,10 +120,11 @@ def create_app() -> FastAPI:
             first_chunk = b""
 
         async def stream() -> AsyncIterator[bytes]:
-            if first_chunk:
-                yield first_chunk
-            async for chunk in iterator:
-                yield chunk
+            async with aclosing(iterator):
+                if first_chunk:
+                    yield first_chunk
+                async for chunk in iterator:
+                    yield chunk
 
         return stream()
 

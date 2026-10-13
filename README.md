@@ -30,28 +30,146 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - [demo](demo)
 - [docs](docs)
 
-## Quick Start
+## Install and First Run
 
-Python 3.11+ is supported, including Python 3.14. Dependency minimums are FastAPI
-0.118.3, Pydantic 2.12, Uvicorn 0.38, and PyYAML 6.0.3. After an OS/Python upgrade,
-recreate the service virtual environment with the intended interpreter and reinstall
-the workspace dependencies; inference backends have their own environments.
+Run the commands below from the repository root. The shipped configuration uses
+mock backends and placeholder GPUs: it is suitable for trying the UI and routing
+without downloading a model. For actual NVIDIA inference, complete the
+[real GPU and backend setup](docs/installation.md#real-gpu-and-backend-setup).
 
-1. Bootstrap a fresh clone with `make setup` or `./scripts/bootstrap.sh`.
-2. Optional: create a repo `.env` from [.env.example](.env.example) and set `HF_TOKEN` if backends need to download models from Hugging Face.
-3. Start the full local stack with `make dev` or `./scripts/run-local.sh`.
+### Prerequisites
 
-Default ports:
+| Component | Requirement |
+| --- | --- |
+| OS | Linux for GPU operation. macOS can run the mock demo and development tools; native Windows is not supported by the current POSIX process/file-lock code. |
+| Python | 3.11+ for the Shardon services; backend runtimes have their own Python/CUDA requirements. |
+| Python packages | [uv](https://docs.astral.sh/uv/getting-started/installation/), available on `PATH`. |
+| Frontend | [Node.js with npm](https://nodejs.org/en/download); use a supported LTS release. The current Vite package requires Node 18 or Node 20+. |
+| Tools | Git, Bash, and `make` for the shortcuts; `curl` for the checks below. |
+| Real inference | NVIDIA driver with working `nvidia-smi`, a separately installed vLLM/SGLang runtime, and enough disk/VRAM for your model. |
 
-- Admin API: `http://127.0.0.1:8081`
-- Router API: `http://127.0.0.1:8080`
-- Admin UI: `http://127.0.0.1:5173`
+Install uv if needed using its [official installer](https://docs.astral.sh/uv/getting-started/installation/):
 
-Individual services are also available:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-- `make admin`
-- `make router`
-- `make web`
+Open a new terminal if `uv` is not yet on `PATH`. Check your tools:
+
+```bash
+uv --version
+node --version
+npm --version
+```
+
+### 1. Get the repository and install dependencies
+
+```bash
+git clone https://github.com/mgravey/Shardon.git
+cd Shardon
+uv python install 3.11
+UV_PYTHON=3.11 ./scripts/bootstrap.sh
+make validate
+```
+
+Bootstrap installs all Python workspace packages and development tools into
+`.venv`, installs the UI dependencies, and creates enabled-config symlinks.
+It does **not** install NVIDIA drivers, vLLM/SGLang, or model weights.
+You can choose another supported Python version by changing both `3.11` values.
+`make setup` is the shortcut for the bootstrap script.
+
+**Fresh installs only:** bootstrap's symlink-refresh step replaces enabled YAML
+entries and enables **every** available definition, including demo definitions.
+For an existing customized installation, use the [update procedure](docs/installation.md#updates-and-backups)
+instead so your enabled selection is preserved.
+
+### 2. Optional model-download settings
+
+Skip this step for the mock demo. If your model needs Hugging Face access:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Do this only if you do not already have a `.env`. Edit it to set your real
+`HF_TOKEN` and an **absolute, writable** `HF_HOME` cache directory. The example
+`/var/lib/shardon/huggingface` may need to be created with the appropriate owner;
+you can choose a directory under your home instead. The `.env` loader does not
+expand `~` or `$HOME` inside values. Exported environment variables take precedence.
+
+### 3. Start the services and sign in
+
+```bash
+make dev
+```
+
+This starts both APIs and the Vite development UI in the foreground. The script
+is also available directly as `./scripts/run-local.sh`.
+
+| Service | Default address | Purpose |
+| --- | --- | --- |
+| Admin UI | <http://127.0.0.1:5173> | Configure models, keys, GPUs, and inspect live activity/usage. |
+| Admin API | <http://127.0.0.1:8081> | Control plane; API documentation at `/docs`. |
+| Router API | <http://127.0.0.1:8080> | Inference plane; OpenAI client base URL ends in `/v1`. |
+
+Open the UI and sign in with the demo credentials **`admin` / `admin`**.
+[Set your own admin password](docs/installation.md#admin-password) before sharing
+access. No inference API key is pre-created.
+
+For a remote host, keep these loopback bindings and open an SSH tunnel from your
+computer, then use the same local URLs:
+
+```bash
+ssh -N -L 5173:127.0.0.1:5173 -L 8080:127.0.0.1:8080 user@your-server
+```
+
+### 4. Create an API key and send a request
+
+In the admin UI's API-key section, choose a **unique key ID** and an owner/user
+name, create the key, and save the returned secret. Use distinct keys for different
+applications to make the usage statistics useful.
+
+In another terminal:
+
+```bash
+export SHARDON_API_KEY='paste-the-new-key-here'
+curl --fail-with-body http://127.0.0.1:8080/health
+curl --fail-with-body http://127.0.0.1:8081/health
+curl --fail-with-body http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer $SHARDON_API_KEY"
+curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $SHARDON_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"demo-chat","messages":[{"role":"user","content":"Hello Shardon"}]}'
+```
+
+With the bundled config, the last request starts the mock backend and returns a
+synthetic reply. With a real deployment, replace `demo-chat` with its
+`api_model_name`; the first request can wait for model download/startup.
+Health checks confirm the APIs are running; a successful inference request also
+checks authentication, routing, backend startup, and response forwarding.
+
+### 5. Check loaded models and usage
+
+The large header names the loaded model(s). Below it, the live board shows who is
+in flight, who is waiting, model-loading progress, GPU placement, and batch items.
+The leaderboard counts requests and backend-reported tokens by API key or user.
+
+Clients may request `"model":"currently-loaded"` to use a compatible model that
+is already ready. If none is loaded, this returns 404; use a concrete model name
+or manually load a deployment first. In the leaderboard, **Model names** switches
+between **Actual model used** and **Requested model name**, which keeps those
+requests grouped under `currently-loaded`.
+
+The bundled mock replies do not report token usage or provide real SSE streaming:
+request counts work, while token counts show **Unavailable**. This is expected.
+See [Activity and usage](docs/activity-and-usage.md) for coverage, history, and
+streaming accounting details.
+
+For configuration examples, separate service commands, password changes, startup
+troubleshooting, deployment notes, backups, and upgrades, continue with the
+[installation and operations guide](docs/installation.md).
 
 ## Core Ideas
 
@@ -143,6 +261,8 @@ Live router smoke test:
 
 ## Documentation
 
+- [Installation and operations](docs/installation.md)
+- [Activity and usage](docs/activity-and-usage.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Scheduling](docs/scheduling.md)
@@ -152,3 +272,22 @@ Live router smoke test:
 - [Batching](docs/batch.md)
 - [Debugging](docs/debugging.md)
 - [Running Backends Outside Shardon](docs/backends-outside-shardon.md)
+
+## Live Activity and Token Usage
+
+The admin dashboard prominently names every currently loaded model at the top,
+with GPU placement and automatic refresh, even when activity filters are applied.
+Below it, the live activity board shows requests by model,
+API key, and owner. It distinguishes waiting, model loading, and backend in-flight
+requests, shows wait reasons and GPU placement, and lists batch item progress.
+Activity refreshes every two seconds while the page is visible; stale data stays
+visible with a warning when an update fails.
+
+The token leaderboard ranks API keys or users with per-model breakdowns for Today,
+7 days, and 30 days (UTC calendar days). A Model names selector switches the
+statistics between the actual model used and the requested name (including
+`currently-loaded`). Counts come from backend-reported usage;
+missing counts are shown as unavailable, with coverage indicating partial totals.
+History is stored under `state/usage/`, survives restarts and key revocation, and
+contains no prompts, responses, or API secrets. Tracking begins with this version.
+See [Activity and usage](docs/activity-and-usage.md) for API details and limitations.

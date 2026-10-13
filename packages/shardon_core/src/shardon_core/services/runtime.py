@@ -5,6 +5,7 @@ import getpass
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,7 +31,8 @@ from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig
 from shardon_core.config.writer import delete_yaml, ensure_symlink, write_yaml
 from shardon_core.gpu.provider import GPUProvider, NvidiaSMIProvider
 from shardon_core.logging.events import EventLogger
-from shardon_core.scheduler.engine import SchedulerEngine, SchedulingRequest
+from shardon_core.scheduler.engine import SchedulerEngine, SchedulingDecision, SchedulingRequest
+from shardon_core.services.observability import StreamUsage, TokenUsage, UsageStore, extract_usage
 from shardon_core.state.models import (
     ActiveRequest,
     BatchJobState,
@@ -64,6 +66,8 @@ class ShardonRuntime:
         self.state_root = repo_root / self.config.global_config.state_root
         self.event_logger = EventLogger(self.state_root)
         self.state_store = RuntimeStateStore(self.state_root, self.event_logger)
+        self.usage_store = UsageStore(self.state_root)
+        self._request_usage: dict[str, TokenUsage] = {}
         self.api_keys = APIKeyService(self.state_root, self.event_logger)
         self.admin_auth = AdminAuthService(
             admin_users=self.config.admin_users,
@@ -648,12 +652,22 @@ class ShardonRuntime:
 
         def mutate(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
             if clear_interactive:
-                cleared_interactive_request_ids.extend([item.id for item in snapshot.queued_requests])
-                snapshot.queued_requests = []
+                waiting = [
+                    item.id
+                    for item in snapshot.queued_requests
+                    if item.status == "queued" and item.id not in snapshot.active_requests
+                ]
+                cleared_interactive_request_ids.extend(waiting)
+                for request_id in waiting:
+                    self._finalize_request(snapshot, request_id, "cancelled")
             if clear_batches:
                 for job in snapshot.batch_jobs.values():
                     if job.status != "queued":
                         continue
+                    for index in range(job.total_items):
+                        item = self._batch_request(job, index)
+                        self.usage_store.record(item, "cancelled")
+                    job.cancelled_items = job.total_items
                     job.status = "cancelled"
                     job.updated_at = utc_now_iso()
                     cancelled_batch_ids.append(job.id)
@@ -702,14 +716,17 @@ class ShardonRuntime:
         auth: AuthResult,
     ) -> AsyncIterator[bytes]:
         payload = request.model_dump(mode="json")
-        async for chunk in self._route_interactive_stream(
-            "completion",
-            request.model,
-            payload,
-            auth,
-            required_capability="text",
-        ):
-            yield chunk
+        async with aclosing(
+            self._route_interactive_stream(
+                "completion",
+                request.model,
+                payload,
+                auth,
+                required_capability="text",
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def route_response(
         self,
@@ -730,14 +747,17 @@ class ShardonRuntime:
         auth: AuthResult,
     ) -> AsyncIterator[bytes]:
         payload = request.model_dump(mode="json")
-        async for chunk in self._route_interactive_stream(
-            "response",
-            request.model,
-            payload,
-            auth,
-            required_capability="text",
-        ):
-            yield chunk
+        async with aclosing(
+            self._route_interactive_stream(
+                "response",
+                request.model,
+                payload,
+                auth,
+                required_capability="text",
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def route_embedding(
         self,
@@ -816,6 +836,25 @@ class ShardonRuntime:
             )
         return response
 
+    @asynccontextmanager
+    async def _observe_request(self, request_id: str) -> AsyncIterator[None]:
+        outcome = "failed"
+        try:
+            yield
+            outcome = "completed"
+        except (asyncio.CancelledError, GeneratorExit):
+            outcome = "cancelled"
+            raise
+        finally:
+            state = self.state_store.load()
+            if request_id in state.active_requests or any(
+                item.id == request_id for item in state.queued_requests
+            ):
+                self.state_store.mutate(
+                    lambda state: self._finalize_request(state, request_id, outcome)
+                )
+            self._request_usage.pop(request_id, None)
+
     async def _route_interactive(
         self,
         task: str,
@@ -826,9 +865,57 @@ class ShardonRuntime:
         required_capability: Literal["text", "audio", "image", "video"],
         uploaded_file: UploadedFilePayload | None = None,
     ) -> Any:
+        request_id = f"req_{uuid.uuid4().hex}"
+        async with self._observe_request(request_id):
+            return await self._route_interactive_inner(
+                task,
+                model_name,
+                payload,
+                auth,
+                request_id=request_id,
+                required_capability=required_capability,
+                uploaded_file=uploaded_file,
+            )
+
+    async def _route_interactive_stream(
+        self,
+        task: str,
+        model_name: str,
+        payload: dict[str, Any],
+        auth: AuthResult,
+        *,
+        required_capability: Literal["text", "audio", "image", "video"],
+    ) -> AsyncIterator[bytes]:
+        request_id = f"req_{uuid.uuid4().hex}"
+        async with (
+            self._observe_request(request_id),
+            aclosing(
+                self._route_interactive_stream_inner(
+                    task,
+                    model_name,
+                    payload,
+                    auth,
+                    request_id=request_id,
+                    required_capability=required_capability,
+                )
+            ) as stream,
+        ):
+            async for chunk in stream:
+                yield chunk
+
+    async def _route_interactive_inner(
+        self,
+        task: str,
+        model_name: str,
+        payload: dict[str, Any],
+        auth: AuthResult,
+        *,
+        request_id: str,
+        required_capability: Literal["text", "audio", "image", "video"],
+        uploaded_file: UploadedFilePayload | None = None,
+    ) -> Any:
         self.refresh_gpu_observations()
         self.enforce_keep_free()
-        request_id = f"req_{uuid.uuid4().hex}"
         preflight_snapshot = self.snapshot()
         requested_model_name = model_name
         model_name = self._resolve_model_alias(
@@ -880,6 +967,8 @@ class ShardonRuntime:
             request_class="interactive",
             model_name=model_name,
             status="queued",
+            task=task,
+            requested_model_name=requested_model_name,
             priority=auth.priority,
             created_at=utc_now_iso(),
         )
@@ -913,6 +1002,12 @@ class ShardonRuntime:
                 utc_now(),
             )
             last_decision_reason = decision.reason
+            self._update_request_observation(
+                request_id,
+                wait_reason=decision.reason,
+                deployment_id=decision.deployment_id or "",
+                gpu_group_id=decision.gpu_group_id or "",
+            )
             last_detail = self._build_candidate_status(
                 model_name=model_name,
                 task=task,
@@ -920,7 +1015,6 @@ class ShardonRuntime:
                 snapshot=snapshot,
             )
             if not decision.accepted and decision.status_code == 404:
-                self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                 detail = {
                     "error": "no compatible deployment",
                     "model_name": model_name,
@@ -967,15 +1061,12 @@ class ShardonRuntime:
                             diagnostic,
                         )
                     )
-                    self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                     raise
                 except (asyncio.CancelledError, GeneratorExit):
-                    self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                     raise
             await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
             self.refresh_gpu_observations()
             self.enforce_keep_free()
-        self.state_store.mutate(lambda state: self._drop_request(state, request_id))
         detail = {
             "error": "request timed out waiting for a deployment",
             "model_name": model_name,
@@ -996,18 +1087,18 @@ class ShardonRuntime:
             status_code=409,
         )
 
-    async def _route_interactive_stream(
+    async def _route_interactive_stream_inner(
         self,
         task: str,
         model_name: str,
         payload: dict[str, Any],
         auth: AuthResult,
         *,
+        request_id: str,
         required_capability: Literal["text", "audio", "image", "video"],
     ) -> AsyncIterator[bytes]:
         self.refresh_gpu_observations()
         self.enforce_keep_free()
-        request_id = f"req_{uuid.uuid4().hex}"
         preflight_snapshot = self.snapshot()
         requested_model_name = model_name
         model_name = self._resolve_model_alias(
@@ -1055,6 +1146,8 @@ class ShardonRuntime:
             request_class="interactive",
             model_name=model_name,
             status="queued",
+            task=task,
+            requested_model_name=requested_model_name,
             priority=auth.priority,
             created_at=utc_now_iso(),
         )
@@ -1088,6 +1181,12 @@ class ShardonRuntime:
                 utc_now(),
             )
             last_decision_reason = decision.reason
+            self._update_request_observation(
+                request_id,
+                wait_reason=decision.reason,
+                deployment_id=decision.deployment_id or "",
+                gpu_group_id=decision.gpu_group_id or "",
+            )
             last_detail = self._build_candidate_status(
                 model_name=model_name,
                 task=task,
@@ -1095,7 +1194,6 @@ class ShardonRuntime:
                 snapshot=snapshot,
             )
             if not decision.accepted and decision.status_code == 404:
-                self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                 detail = {
                     "error": "no compatible deployment",
                     "model_name": model_name,
@@ -1119,18 +1217,21 @@ class ShardonRuntime:
                     continue
                 deployment = self.config.deployments[decision.deployment_id]
                 try:
-                    async for chunk in self._execute_stream_request(
-                        deployment=deployment,
-                        request_id=request_id,
-                        payload=payload,
-                        task=task,
-                        auth=auth,
-                        target_gpu_group_id=(
-                            decision.gpu_group_id or deployment.preferred_gpu_group_id()
-                        ),
-                        should_evict=decision.should_evict or [],
-                    ):
-                        yield chunk
+                    async with aclosing(
+                        self._execute_stream_request(
+                            deployment=deployment,
+                            request_id=request_id,
+                            payload=payload,
+                            task=task,
+                            auth=auth,
+                            target_gpu_group_id=(
+                                decision.gpu_group_id or deployment.preferred_gpu_group_id()
+                            ),
+                            should_evict=decision.should_evict or [],
+                        )
+                    ) as stream:
+                        async for chunk in stream:
+                            yield chunk
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
                     return
                 except RuntimeOperationError as exc:
@@ -1142,12 +1243,10 @@ class ShardonRuntime:
                             diagnostic,
                         )
                     )
-                    self.state_store.mutate(lambda state: self._drop_request(state, request_id))
                     raise
             await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
             self.refresh_gpu_observations()
             self.enforce_keep_free()
-        self.state_store.mutate(lambda state: self._drop_request(state, request_id))
         detail = {
             "error": "request timed out waiting for a deployment",
             "model_name": model_name,
@@ -1210,6 +1309,14 @@ class ShardonRuntime:
                     status_code=409,
                 )
             planned_evictions.append(deployment.id)
+        self._update_request_observation(
+            request_id,
+            phase="loading" if should_start else "waiting",
+            wait_reason="Loading model" if should_start else "Waiting for backend dispatch",
+            deployment_id=deployment.id,
+            backend_runtime_id=deployment.backend_runtime_id,
+            gpu_group_id=target_gpu_group_id,
+        )
         if should_start:
             planned_evictions = list(dict.fromkeys(planned_evictions))
             self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
@@ -1241,6 +1348,7 @@ class ShardonRuntime:
                     payload=payload,
                     uploaded_file=uploaded_file,
                 )
+                self._request_usage[request_id] = extract_usage(result)
                 self.state_store.mutate(
                     lambda state: self._mark_request_finished(state, request_id, deployment.id)
                 )
@@ -1393,6 +1501,14 @@ class ShardonRuntime:
                     status_code=409,
                 )
             planned_evictions.append(deployment.id)
+        self._update_request_observation(
+            request_id,
+            phase="loading" if should_start else "waiting",
+            wait_reason="Loading model" if should_start else "Waiting for backend dispatch",
+            deployment_id=deployment.id,
+            backend_runtime_id=deployment.backend_runtime_id,
+            gpu_group_id=target_gpu_group_id,
+        )
         if should_start:
             planned_evictions = list(dict.fromkeys(planned_evictions))
             self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
@@ -1413,6 +1529,8 @@ class ShardonRuntime:
         observed_pid = self.snapshot().deployments[deployment.id].process_id
         recovery_attempts = 0
         sent_any_chunk = False
+        usage_observer = StreamUsage()
+        self._request_usage[request_id] = usage_observer.usage
         while True:
             adapter = self.backends.adapter_for(
                 deployment.backend_runtime_id,
@@ -1424,12 +1542,22 @@ class ShardonRuntime:
                     if task == "response"
                     else adapter.stream_completion(payload)
                 )
-                async for chunk in stream:
-                    sent_any_chunk = True
-                    yield chunk
-                self.state_store.mutate(
-                    lambda state: self._mark_request_finished(state, request_id, deployment.id)
-                )
+                async with aclosing(stream):
+                    async for chunk in stream:
+                        sent_any_chunk = True
+                        usage_observer.feed(chunk)
+                        yield chunk
+                usage_observer.finish()
+                if usage_observer.outcome:
+                    self.state_store.mutate(
+                        lambda state: self._finalize_request(
+                            state, request_id, usage_observer.outcome
+                        )
+                    )
+                else:
+                    self.state_store.mutate(
+                        lambda state: self._mark_request_finished(state, request_id, deployment.id)
+                    )
                 return
             except RuntimeOperationError as exc:
                 runtime_error = str(exc)
@@ -1444,12 +1572,7 @@ class ShardonRuntime:
                 raise
             except (asyncio.CancelledError, GeneratorExit):
                 self.state_store.mutate(
-                    lambda state: self._mark_request_failed(
-                        state,
-                        request_id,
-                        deployment.id,
-                        "stream cancelled",
-                    )
+                    lambda state: self._finalize_request(state, request_id, "cancelled")
                 )
                 raise
             except Exception as exc:
@@ -1827,8 +1950,45 @@ class ShardonRuntime:
         return snapshot
 
     def _drop_request(self, snapshot: RuntimeStateSnapshot, request_id: str) -> RuntimeStateSnapshot:
-        snapshot.queued_requests = [item for item in snapshot.queued_requests if item.id != request_id]
+        return self._finalize_request(snapshot, request_id, "cancelled")
+
+    def _update_request_observation(self, request_id: str, **changes: Any) -> None:
+        snapshot = self.state_store.load()
+        request = snapshot.active_requests.get(request_id) or next(
+            (r for r in snapshot.queued_requests if r.id == request_id), None
+        )
+        if request is None or all(getattr(request, k) == v for k, v in changes.items()):
+            return
+
+        def update(state: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            requests = [r for r in state.queued_requests if r.id == request_id]
+            if request_id in state.active_requests:
+                requests.append(state.active_requests[request_id])
+            for item in requests:
+                for name, value in changes.items():
+                    setattr(item, name, value)
+            return state
+
+        self.state_store.mutate(update)
+
+    def _finalize_request(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        request_id: str,
+        outcome: str,
+    ) -> RuntimeStateSnapshot:
+        request = snapshot.active_requests.get(request_id) or next(
+            (r for r in snapshot.queued_requests if r.id == request_id), None
+        )
+        if request is not None:
+            request.finished_at = utc_now_iso()
+            self.usage_store.record(request, outcome, self._request_usage.get(request_id))
+        snapshot = self._dequeue_request(snapshot, request_id)
         snapshot.active_requests.pop(request_id, None)
+        for deployment in snapshot.deployments.values():
+            deployment.active_request_ids = [
+                r for r in deployment.active_request_ids if r != request_id
+            ]
         return snapshot
 
     def _mark_request_diagnostic(
@@ -2049,6 +2209,8 @@ class ShardonRuntime:
         queued.backend_runtime_id = deployment.backend_runtime_id
         queued.gpu_group_id = selected_gpu_group_id
         queued.status = "running"
+        queued.phase = "in_flight"
+        queued.wait_reason = None
         queued.started_at = utc_now_iso()
         snapshot.active_requests[request_id] = queued
         runtime = snapshot.deployments[deployment.id]
@@ -2073,11 +2235,7 @@ class ShardonRuntime:
         request_id: str,
         deployment_id: str,
     ) -> RuntimeStateSnapshot:
-        snapshot = self._dequeue_request(snapshot, request_id)
-        request = snapshot.active_requests.pop(request_id, None)
-        if request is not None:
-            request.status = "completed"
-            request.finished_at = utc_now_iso()
+        snapshot = self._finalize_request(snapshot, request_id, "completed")
         runtime = snapshot.deployments[deployment_id]
         runtime.active_request_ids = [item for item in runtime.active_request_ids if item != request_id]
         runtime.last_used_at = utc_now_iso()
@@ -2098,12 +2256,7 @@ class ShardonRuntime:
         deployment_id: str,
         error: str,
     ) -> RuntimeStateSnapshot:
-        snapshot = self._dequeue_request(snapshot, request_id)
-        request = snapshot.active_requests.pop(request_id, None)
-        if request is not None:
-            request.status = "failed"
-            request.finished_at = utc_now_iso()
-            request.error = error
+        snapshot = self._finalize_request(snapshot, request_id, "failed")
         runtime = snapshot.deployments[deployment_id]
         runtime.active_request_ids = [item for item in runtime.active_request_ids if item != request_id]
         runtime.last_used_at = utc_now_iso()
@@ -2161,8 +2314,55 @@ class ShardonRuntime:
         )
         if not decision.accepted or decision.deployment_id is None:
             return
+        try:
+            await self._execute_batch_job(job, decision)
+        except asyncio.CancelledError:
+            self.state_store.mutate(
+                lambda state: self._finalize_pending_batch(state, job.id, "cancelled")
+            )
+            raise
+        except Exception:
+            self.state_store.mutate(
+                lambda state: self._finalize_pending_batch(state, job.id, "failed")
+            )
+            raise
+
+    def _finalize_pending_batch(
+        self,
+        state: RuntimeStateSnapshot,
+        batch_id: str,
+        outcome: str,
+    ) -> RuntimeStateSnapshot:
+        job = state.batch_jobs[batch_id]
+        if job.status in {"completed", "failed", "cancelled"}:
+            return state
+        accounted = job.completed_items + job.failed_items + job.cancelled_items
+        for index in range(accounted, job.total_items):
+            self.usage_store.record(self._batch_request(job, index), outcome)
+        if outcome == "cancelled":
+            job.cancelled_items += job.total_items - accounted
+        else:
+            job.failed_items += job.total_items - accounted
+        job.status = outcome
+        job.current_item = None
+        job.updated_at = utc_now_iso()
+        return state
+
+    async def _execute_batch_job(self, job: BatchJobState, decision: SchedulingDecision) -> None:
         deployment = self.config.deployments[decision.deployment_id]
         selected_gpu_group_id = decision.gpu_group_id or deployment.preferred_gpu_group_id()
+
+        def assign(state: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            current = state.batch_jobs[job.id]
+            if current.status == "queued":
+                current.deployment_id = deployment.id
+                current.gpu_group_id = selected_gpu_group_id
+            return state
+
+        state = self.state_store.mutate(assign)
+        job = state.batch_jobs[job.id]
+        if job.status != "queued":
+            return
         if decision.should_load:
             self._prepare_group_for_load(
                 decision.should_evict or [],
@@ -2177,20 +2377,83 @@ class ShardonRuntime:
             deployment.backend_runtime_id,
             gpu_group_id=selected_gpu_group_id,
         )
-        self.state_store.mutate(lambda state: self._mark_batch_running(state, job.id, deployment.id))
+        state = self.state_store.mutate(
+            lambda state: self._mark_batch_running(state, job.id, deployment.id)
+        )
+        if state.batch_jobs[job.id].status != "running":
+            return
         requests = job.metadata.get("requests", [])
         completed = 0
         failed = 0
-        for item in requests:
+        for index, item in enumerate(requests):
+            tracked = self._batch_request(job, index)
+            tracked.deployment_id = deployment.id
+            tracked.backend_runtime_id = deployment.backend_runtime_id
+            tracked.gpu_group_id = selected_gpu_group_id
+            tracked.started_at = utc_now_iso()
+            tracked.status = "running"
+            tracked.phase = "in_flight"
+
+            def begin(
+                state: RuntimeStateSnapshot,
+                index: int = index,
+                tracked: ActiveRequest = tracked,
+            ) -> RuntimeStateSnapshot:
+                state.batch_jobs[job.id].current_item = index + 1
+                state.batch_jobs[job.id].gpu_group_id = selected_gpu_group_id
+                state.active_requests[tracked.id] = tracked
+                state.deployments[deployment.id].active_request_ids.append(tracked.id)
+                return state
+
+            self.state_store.mutate(begin)
+            outcome = "failed"
             try:
-                await adapter.invoke_chat(item)
+                result = await adapter.invoke_chat(item)
+                self._request_usage[tracked.id] = extract_usage(result)
+                outcome = "completed"
                 completed += 1
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             except Exception:
                 failed += 1
-            self.state_store.mutate(
-                lambda state: self._update_batch_progress(state, job.id, completed, failed)
-            )
+            finally:
+                self.state_store.mutate(
+                    lambda state, tracked=tracked, outcome=outcome: self._finalize_request(
+                        state, tracked.id, outcome
+                    )
+                )
+                self._request_usage.pop(tracked.id, None)
+                if outcome == "cancelled":
+                    self.state_store.mutate(
+                        lambda state: self._finalize_pending_batch(state, job.id, "cancelled")
+                    )
+                else:
+                    self.state_store.mutate(
+                        lambda state, completed=completed, failed=failed: (
+                            self._update_batch_progress(state, job.id, completed, failed)
+                        )
+                    )
         self.state_store.mutate(lambda state: self._finish_batch(state, job.id, completed, failed))
+
+    def _batch_request(self, job: BatchJobState, index: int) -> ActiveRequest:
+        deployment = self.config.deployments.get(job.deployment_id or "")
+        return ActiveRequest(
+            id=f"{job.id}:item:{index + 1}",
+            api_key_id=job.api_key_id,
+            user_name=job.user_name,
+            model_name=job.model_name,
+            requested_model_name=job.model_name,
+            deployment_id=job.deployment_id or "",
+            backend_runtime_id=deployment.backend_runtime_id if deployment else "",
+            gpu_group_id=job.gpu_group_id or "",
+            request_class="batch",
+            batch_id=job.id,
+            task="chat",
+            status="queued",
+            priority=100,
+            created_at=job.created_at,
+        )
 
     def _mark_batch_running(
         self,
@@ -2199,6 +2462,8 @@ class ShardonRuntime:
         deployment_id: str,
     ) -> RuntimeStateSnapshot:
         job = snapshot.batch_jobs[batch_id]
+        if job.status != "queued":
+            return snapshot
         job.status = "running"
         job.updated_at = utc_now_iso()
         job.deployment_id = deployment_id
@@ -2212,6 +2477,7 @@ class ShardonRuntime:
         failed: int,
     ) -> RuntimeStateSnapshot:
         job = snapshot.batch_jobs[batch_id]
+        job.current_item = None
         job.completed_items = completed
         job.failed_items = failed
         job.updated_at = utc_now_iso()
@@ -2226,6 +2492,7 @@ class ShardonRuntime:
     ) -> RuntimeStateSnapshot:
         job = snapshot.batch_jobs[batch_id]
         job.status = "completed" if failed == 0 else "failed"
+        job.current_item = None
         job.completed_items = completed
         job.failed_items = failed
         job.updated_at = utc_now_iso()
