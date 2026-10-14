@@ -1,5 +1,12 @@
 # Changes
 
+## 2026-10-14
+
+- Track router instance ownership with process-held locks and recover interrupted requests on router startup and scheduler ticks, preserving live and unverifiable owners.
+- Remove recovered queue, active-request, and deployment references together; retain interruption reasons and deduplicate usage across recovery retries, including partially committed batch progress.
+- Close prefetched streaming iterators on client disconnects and failed sends, including failures before headers.
+- Add real SIGKILL/restart, live-owner, interrupted-accounting, batch recovery, and streaming disconnect regression tests.
+
 ## 2026-10-10
 
 - Forward optional chat response-format and reasoning-effort options to backends.

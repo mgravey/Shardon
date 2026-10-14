@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 class ActiveRequest(BaseModel):
     id: str
+    router_instance_id: str | None = None
+    interruption_reason: str | None = None
     user_name: str
     api_key_id: str
     deployment_id: str
@@ -30,6 +32,8 @@ class ActiveRequest(BaseModel):
 
 class BatchJobState(BaseModel):
     id: str
+    router_instance_id: str | None = None
+    interruption_reason: str | None = None
     api_key_id: str
     user_name: str
     deployment_id: str | None = None

@@ -88,6 +88,54 @@ signatures; caches are rebuildable and remain in memory. No database is used.
 Files are kept until an operator removes them; automatic retention is not enabled.
 Revoking a key does not remove its historical usage.
 
+## Router crashes and request recovery
+
+Every admitted interactive request and claimed batch job carries a unique router
+instance ID. Each instance holds an exclusive OS file lock in `routers/` under the
+configured state root for its serving lifetime. The OS releases the lock on process
+exit, including SIGKILL, without requiring Python cancellation or `finally` handlers.
+Instance IDs are never reused; PID reuse, request age, GPU identity, and service-manager
+behavior do not determine abandonment.
+
+Before accepting traffic, and on each background scheduler tick, the router checks
+owners referenced by persisted work. An existing owner lock that can be acquired
+proves that instance has ended. Recovery records a `failed` usage outcome with the
+reason `router instance terminated before request finalization`, emits a
+`request.interrupted` event for tracked requests, and removes all references from
+the interactive queue, active-request map, and deployment active-request lists in
+one locked runtime-state update. Interrupted batch jobs fail their remaining items;
+unclaimed queued jobs remain eligible for scheduling. Work is never automatically
+replayed after a crash, since a backend may already have executed it.
+
+The first committed usage record for a request ID wins. Recovery can be repeated,
+including after a crash between writing usage and committing runtime state, without
+double counting requests or tokens. Existing successful accounting remains successful.
+Batch progress also respects previously committed item outcomes. Tokens not durably
+recorded before a crash remain unknown. Usage history includes the owner ID and the
+fixed interruption reason, without recording raw backend errors or request content.
+
+Live owners retain their requests regardless of age. Constructing a runtime container
+or starting the admin API does not recover router work. Older requests without an
+owner ID, missing owner-lock files, and locks whose status cannot be established are
+preserved: those cases cannot safely prove that the request was abandoned. Upgrading
+therefore does not automatically clear pre-upgrade orphaned requests. Such legacy
+state requires operator reconciliation after independently verifying router ownership.
+
+All cooperating routers must use the same state directory on a filesystem supporting
+cross-process `flock` locks and atomic replacement. Keep `routers/` lock files with
+their runtime state; do not delete or replace them while routers are running. Empty
+lock files are retained as termination witnesses, with no age-based pruning. No
+database, heartbeat timeout, hardware-specific check, or deployment-specific path is
+required.
+
+Normal task cancellation finalizes admitted work as `cancelled`. Streaming responses
+explicitly close their prefetched iterator when sending fails or the client disconnects,
+including before headers or the first response bytes. Cleanup retains any usage already
+observed and removes active/queued references. Forced process termination instead uses
+the recovery mechanism above.
+
+## Dashboard refresh
+
 The UI polls activity every two seconds and usage every thirty seconds, pausing
 when the page is hidden and refreshing on return. Failed refreshes preserve the
 last successful result with a stale indicator. Configuration editors are not

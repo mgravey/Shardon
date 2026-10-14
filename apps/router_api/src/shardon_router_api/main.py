@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import os
 from collections.abc import AsyncIterator
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
 import uvicorn
 from fastapi import (
     Depends,
@@ -35,6 +36,44 @@ from shardon_core.backends.base import UploadedFilePayload
 from shardon_core.services.container import build_container
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.utils.env import load_dotenv_file
+from starlette.types import Receive, Scope, Send
+
+
+class RequestStreamingResponse(StreamingResponse):
+    """Own the prefetched iterator even if sending headers/first bytes fails."""
+
+    def __init__(self, iterator: AsyncIterator[bytes], first_chunk: bytes) -> None:
+        self.iterator = iterator
+
+        async def stream() -> AsyncIterator[bytes]:
+            if first_chunk:
+                yield first_chunk
+            async for chunk in iterator:
+                yield chunk
+
+        super().__init__(stream(), media_type="text/event-stream")
+
+    @classmethod
+    async def prefetch(cls, iterator: AsyncIterator[bytes]) -> RequestStreamingResponse:
+        try:
+            first_chunk = await anext(iterator, b"")
+            return cls(iterator, first_chunk)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await iterator.aclose()
+            raise
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette may cancel streaming on disconnect while the generator
+            # is suspended at yield (including before its first iteration).
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self.iterator.aclose()
 
 
 def _repo_root() -> Path:
@@ -46,6 +85,7 @@ def _repo_root() -> Path:
 
 async def _run_background_tick(runtime: ShardonRuntime) -> None:
     try:
+        runtime.recover_interrupted_requests()
         runtime.refresh_gpu_observations()
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
@@ -66,6 +106,7 @@ async def _run_background_tick(runtime: ShardonRuntime) -> None:
 async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
     runtime = app.state.runtime
+    runtime.start_router()
 
     async def background() -> None:
         while not stop_event.is_set():
@@ -78,8 +119,11 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        finally:
+            runtime.stop_router()
 
 
 def create_app() -> FastAPI:
@@ -113,21 +157,6 @@ def create_app() -> FastAPI:
         media_type = "text/vtt" if payload.response_format == "vtt" else "text/plain"
         return Response(content=text, media_type=media_type)
 
-    async def _prefetched_stream(iterator: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-        try:
-            first_chunk = await anext(iterator)
-        except StopAsyncIteration:
-            first_chunk = b""
-
-        async def stream() -> AsyncIterator[bytes]:
-            async with aclosing(iterator):
-                if first_chunk:
-                    yield first_chunk
-                async for chunk in iterator:
-                    yield chunk
-
-        return stream()
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "router"}
@@ -159,8 +188,9 @@ def create_app() -> FastAPI:
     ) -> Any:
         try:
             if payload.model_dump(mode="json").get("stream") is True:
-                stream = await _prefetched_stream(runtime.stream_response(payload, auth))
-                return StreamingResponse(stream, media_type="text/event-stream")
+                return await RequestStreamingResponse.prefetch(
+                    runtime.stream_response(payload, auth)
+                )
             return await runtime.route_response(payload, auth)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -173,8 +203,9 @@ def create_app() -> FastAPI:
     ) -> Any:
         try:
             if payload.model_dump(mode="json").get("stream") is True:
-                stream = await _prefetched_stream(runtime.stream_completion(payload, auth))
-                return StreamingResponse(stream, media_type="text/event-stream")
+                return await RequestStreamingResponse.prefetch(
+                    runtime.stream_completion(payload, auth)
+                )
             return await runtime.route_completion(payload, auth)
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

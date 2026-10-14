@@ -215,6 +215,8 @@ core.*
 node_modules/
 *.tsbuildinfo
 state/usage/
+# Router lifetime lock witnesses are local observed state, retained across restarts.
+state/routers/
 # Local browser verification artifacts (public dashboard, admin login, loaded-model banner).
 .playwright-cli/
 output/playwright/

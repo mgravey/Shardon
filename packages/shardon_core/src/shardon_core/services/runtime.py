@@ -40,6 +40,7 @@ from shardon_core.state.models import (
     DrainState,
     RuntimeStateSnapshot,
 )
+from shardon_core.state.ownership import RouterInstance
 from shardon_core.state.store import RuntimeStateStore
 from shardon_core.utils.time import utc_now, utc_now_iso
 
@@ -68,6 +69,7 @@ class ShardonRuntime:
         self.state_store = RuntimeStateStore(self.state_root, self.event_logger)
         self.usage_store = UsageStore(self.state_root)
         self._request_usage: dict[str, TokenUsage] = {}
+        self._router_instance: RouterInstance | None = None
         self.api_keys = APIKeyService(self.state_root, self.event_logger)
         self.admin_auth = AdminAuthService(
             admin_users=self.config.admin_users,
@@ -84,6 +86,57 @@ class ShardonRuntime:
         self._deployment_locks: dict[str, asyncio.Lock] = {}
         self.service_user = getpass.getuser()
         self.state_store.mutate(self._reconcile_loaded_processes)
+
+    def _ensure_router_instance(self) -> RouterInstance:
+        # Direct core callers also need ownership, but constructing an admin
+        # container must neither register a router nor recover its requests.
+        if self._router_instance is None:
+            self._router_instance = RouterInstance(self.state_root)
+        return self._router_instance
+
+    def start_router(self) -> None:
+        self._ensure_router_instance()
+        try:
+            self.recover_interrupted_requests()
+        except BaseException:
+            self.stop_router()
+            raise
+
+    def stop_router(self) -> None:
+        if self._router_instance is not None:
+            self._router_instance.close()
+            self._router_instance = None
+
+    def recover_interrupted_requests(self) -> None:
+        owner = self._router_instance
+        if owner is None:
+            return
+
+        def recover(state: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            requests = {item.id: item for item in state.queued_requests}
+            requests.update(state.active_requests)
+            owners = {item.router_instance_id for item in requests.values()}
+            owners.update(
+                job.router_instance_id for job in state.batch_jobs.values()
+                if job.status in {"queued", "running"}
+            )
+            terminated = {instance_id for instance_id in owners if owner.terminated(instance_id)}
+            reason = "router instance terminated before request finalization"
+            for request in requests.values():
+                if request.router_instance_id in terminated:
+                    self._finalize_request(state, request.id, "failed", interruption_reason=reason)
+                    self.event_logger.emit(
+                        "request.interrupted",
+                        reason,
+                        request_id=request.id,
+                        router_instance_id=request.router_instance_id,
+                    )
+            for job in state.batch_jobs.values():
+                if job.router_instance_id in terminated:
+                    self._finalize_pending_batch(state, job.id, "failed", reason)
+            return state
+
+        self.state_store.mutate(recover)
 
     def _deployment_lock(self, deployment_id: str) -> asyncio.Lock:
         return self._deployment_locks.setdefault(deployment_id, asyncio.Lock())
@@ -1953,6 +2006,7 @@ class ShardonRuntime:
 
     def _enqueue_request(self, snapshot: RuntimeStateSnapshot, request: ActiveRequest) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
+        request.router_instance_id = self._ensure_router_instance().id
         snapshot.queued_requests.append(request)
         return snapshot
 
@@ -1987,12 +2041,18 @@ class ShardonRuntime:
         snapshot: RuntimeStateSnapshot,
         request_id: str,
         outcome: str,
+        *,
+        interruption_reason: str | None = None,
     ) -> RuntimeStateSnapshot:
         request = snapshot.active_requests.get(request_id) or next(
             (r for r in snapshot.queued_requests if r.id == request_id), None
         )
         if request is not None:
             request.finished_at = utc_now_iso()
+            request.status = outcome
+            if interruption_reason is not None:
+                request.error = interruption_reason
+                request.interruption_reason = interruption_reason
             self.usage_store.record(request, outcome, self._request_usage.get(request_id))
         snapshot = self._dequeue_request(snapshot, request_id)
         snapshot.active_requests.pop(request_id, None)
@@ -2332,7 +2392,10 @@ class ShardonRuntime:
         self.refresh_gpu_observations()
         self.enforce_keep_free()
         snapshot = self.snapshot()
-        queued_jobs = [job for job in snapshot.batch_jobs.values() if job.status == "queued"]
+        queued_jobs = [
+            job for job in snapshot.batch_jobs.values()
+            if job.status == "queued" and job.router_instance_id is None
+        ]
         if not queued_jobs:
             return
         job = sorted(queued_jobs, key=lambda item: item.created_at)[0]
@@ -2368,17 +2431,19 @@ class ShardonRuntime:
         state: RuntimeStateSnapshot,
         batch_id: str,
         outcome: str,
+        interruption_reason: str | None = None,
     ) -> RuntimeStateSnapshot:
         job = state.batch_jobs[batch_id]
         if job.status in {"completed", "failed", "cancelled"}:
             return state
         accounted = job.completed_items + job.failed_items + job.cancelled_items
+        job.interruption_reason = interruption_reason
         for index in range(accounted, job.total_items):
-            self.usage_store.record(self._batch_request(job, index), outcome)
-        if outcome == "cancelled":
-            job.cancelled_items += job.total_items - accounted
-        else:
-            job.failed_items += job.total_items - accounted
+            record = self.usage_store.record(self._batch_request(job, index), outcome)
+            # A crash can occur after recording an item but before saving its
+            # progress. Preserve that first committed outcome and token usage.
+            field = f"{record.outcome}_items"
+            setattr(job, field, getattr(job, field) + 1)
         job.status = outcome
         job.current_item = None
         job.updated_at = utc_now_iso()
@@ -2387,17 +2452,21 @@ class ShardonRuntime:
     async def _execute_batch_job(self, job: BatchJobState, decision: SchedulingDecision) -> None:
         deployment = self.config.deployments[decision.deployment_id]
         selected_gpu_group_id = decision.gpu_group_id or deployment.preferred_gpu_group_id()
+        claimed = False
 
         def assign(state: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            nonlocal claimed
             current = state.batch_jobs[job.id]
-            if current.status == "queued":
+            if current.status == "queued" and current.router_instance_id is None:
+                current.router_instance_id = self._ensure_router_instance().id
                 current.deployment_id = deployment.id
                 current.gpu_group_id = selected_gpu_group_id
+                claimed = True
             return state
 
         state = self.state_store.mutate(assign)
         job = state.batch_jobs[job.id]
-        if job.status != "queued":
+        if not claimed:
             return
         if decision.should_load:
             self._prepare_group_for_load(
@@ -2476,6 +2545,8 @@ class ShardonRuntime:
         deployment = self.config.deployments.get(job.deployment_id or "")
         return ActiveRequest(
             id=f"{job.id}:item:{index + 1}",
+            router_instance_id=job.router_instance_id,
+            interruption_reason=job.interruption_reason,
             api_key_id=job.api_key_id,
             user_name=job.user_name,
             model_name=job.model_name,

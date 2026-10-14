@@ -255,6 +255,11 @@ Chat requests forward optional `response_format` and `reasoning_effort` fields t
 backend. Supported reasoning values are `none`, `low`, `medium`, `high`, and `xhigh`;
 the selected backend/model must support the requested options. Completed and failed
 requests are removed from the queue in the same state update that finalizes them.
+Router startup and scheduler ticks recover requests owned by terminated router
+instances, recording an interruption failure and removing queue/deployment references.
+Process-held instance locks preserve live requests without age-based expiry; starting
+the admin API does not trigger recovery. See [request recovery](docs/activity-and-usage.md#router-crashes-and-request-recovery)
+for accounting, shared-state requirements, and legacy-state limitations.
 
 Live router smoke test:
 

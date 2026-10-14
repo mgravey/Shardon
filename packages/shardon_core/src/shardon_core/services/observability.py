@@ -116,6 +116,8 @@ class StreamUsage:
 
 class UsageRecord(TokenUsage):
     request_id: str
+    router_instance_id: str | None = None
+    interruption_reason: str | None = None
     api_key_id: str
     user_name: str
     model_name: str
@@ -199,11 +201,15 @@ class UsageStore:
         self._days[path] = (signature, result)
         return result
 
-    def record(self, request: ActiveRequest, outcome: str, usage: TokenUsage | None = None) -> None:
+    def record(
+        self, request: ActiveRequest, outcome: str, usage: TokenUsage | None = None
+    ) -> UsageRecord:
         finished = request.finished_at or utc_now().isoformat()
         record = UsageRecord(
             **(usage or TokenUsage()).model_dump(),
             request_id=request.id,
+            router_instance_id=request.router_instance_id,
+            interruption_reason=request.interruption_reason,
             api_key_id=request.api_key_id,
             user_name=request.user_name,
             model_name=request.model_name,
@@ -231,12 +237,10 @@ class UsageStore:
                 path,
                 *(p for p in self.root.glob("*.jsonl") if created_day <= p.stem < day),
             ]
-            if any(
-                item.request_id == record.request_id
-                for candidate in candidates
-                for item in self._read(candidate)
-            ):
-                return
+            for candidate in candidates:
+                for item in self._read(candidate):
+                    if item.request_id == record.request_id:
+                        return item
             # Separate any incomplete final record left by an interrupted writer.
             if path.exists() and path.stat().st_size:
                 with path.open("rb+") as handle:
@@ -249,6 +253,7 @@ class UsageStore:
             # Bound writer-side cache growth across day rollovers. History stays on disk.
             self._days = {p: value for p, value in self._days.items() if p in candidates}
             self._aggregates.clear()
+            return record
 
     def summary(
         self,

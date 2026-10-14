@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Inference router plane for Shardon."
 requires-python = ">=3.11"
 dependencies = [
+  "anyio>=4.0",
   "fastapi>=0.118.3",
   "pydantic>=2.12.0",
   "python-multipart>=0.0.9",
