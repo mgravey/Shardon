@@ -370,6 +370,9 @@ class ActivityDeployment(BaseModel):
     gpu_group_id: str | None
     sleep_enabled: bool = False
     slept_at: str | None = None
+    port: int | None = None
+    kv_used_bytes: int | None = None
+    kv_limit_bytes: int | None = None
 
 
 class ModelActivity(BaseModel):
@@ -448,6 +451,9 @@ def activity_snapshot(
                 ),
                 sleep_enabled=config.sleep_policy_for(deployment.id).enabled,
                 slept_at=state.slept_at if state else None,
+                port=state.port if state else None,
+                kv_used_bytes=snapshot.kvcached_usage.get(deployment.id, {}).get("used_bytes"),
+                kv_limit_bytes=snapshot.kvcached_usage.get(deployment.id, {}).get("limit_bytes"),
             )
         )
     unique = {r.id: r for r in snapshot.queued_requests if r.status == "queued"}

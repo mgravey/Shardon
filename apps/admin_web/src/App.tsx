@@ -19,7 +19,10 @@ type RuntimeData = {
   gpu_groups: Record<string, unknown>;
   backend_health: Record<string, unknown>;
   sleep_policies?: Record<string, { enabled: boolean; idle_seconds: number; level: number }>;
+  kvcached_usage?: Record<string, { used_bytes?: number | null; limit_bytes?: number | null; error?: string | null }>;
 };
+
+const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 
 type EnvironmentStatus = {
   hf_token_configured: boolean;
@@ -458,7 +461,10 @@ export default function App() {
         slept_at?: string | null;
         resident_memory_fraction?: number;
         awake_memory_fraction?: number | null;
+        port?: number | null;
+        footprint_source?: string;
       };
+      const kv = runtime?.kvcached_usage?.[deploymentId];
       const state = String(runtimeState.state ?? "unloaded");
       const sleepPolicy = runtime?.sleep_policies?.[deploymentId];
       return {
@@ -480,6 +486,13 @@ export default function App() {
         sleptAt: runtimeState.slept_at ?? null,
         residentMemory: runtimeState.resident_memory_fraction ?? 0,
         awakeMemory: runtimeState.awake_memory_fraction ?? null,
+        port: runtimeState.port ?? null,
+        footprintSource: String(runtimeState.footprint_source ?? "config"),
+        kvUsage: kv?.error
+          ? `KV: ${kv.error}`
+          : kv && typeof kv.used_bytes === "number"
+            ? `KV cache: ${gib(kv.used_bytes)}${typeof kv.limit_bytes === "number" && kv.limit_bytes > 0 ? ` / ${gib(kv.limit_bytes)}` : ""}`
+            : "",
       };
     })
     .sort((left, right) => Number(right.loaded) - Number(left.loaded) || left.deploymentId.localeCompare(right.deploymentId));
@@ -915,8 +928,11 @@ export default function App() {
                       <span>
                         GPU memory: {Math.round(row.residentMemory * 100)}%
                         {row.awakeMemory !== null ? ` (awake ${Math.round(row.awakeMemory * 100)}%)` : ""}
+                        {row.footprintSource !== "config" ? ` · ${row.footprintSource}` : ""}
                       </span>
                     ) : null}
+                    {row.loaded && row.port !== null ? <span>port {row.port}</span> : null}
+                    {row.kvUsage ? <span>{row.kvUsage}</span> : null}
                     {row.sleptAt ? <span>asleep since {new Date(row.sleptAt).toLocaleTimeString()}</span> : null}
                     {row.sleepEnabled && row.idleSeconds !== null ? (
                       <span>auto-sleep after {Math.round(row.idleSeconds / 60)} min idle</span>

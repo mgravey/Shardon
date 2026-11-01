@@ -276,6 +276,7 @@ def create_app() -> FastAPI:
         runtime.refresh_gpu_observations()
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
+        await runtime.refresh_kvcached_usage()
         return runtime.status()
 
     @app.get("/runtime/activity", response_model=ActivityResponse)

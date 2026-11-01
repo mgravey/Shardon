@@ -302,6 +302,10 @@ class SchedulerEngine:
         sleeping deployments may stay when memory allows. Sleeping deployments
         are always evicted before awake ones.
         """
+        if group.memory_model == "elastic":
+            return self._plan_elastic_admission(
+                group, deployment, snapshot, self_evict=self_evict, waking=waking
+            )
         others = [
             deployment_id
             for deployment_id in self._loaded_in_group(group.id, snapshot)
@@ -362,6 +366,125 @@ class SchedulerEngine:
             sleep=sleep,
         )
 
+    def _plan_elastic_admission(
+        self,
+        group: GPUGroupConfig,
+        deployment: DeploymentConfig,
+        snapshot: RuntimeStateSnapshot,
+        *,
+        self_evict: list[str],
+        waking: bool,
+    ) -> AdmissionPlan | None:
+        """Elastic groups co-host deployments while resident footprints fit.
+
+        Nothing is evicted when the incoming footprint fits. Otherwise memory
+        is freed in this order: sleep idle ``sleep_on_evict`` deployments
+        (least recently used first), stop sleeping deployments, then stop idle
+        awake deployments, least recently used first. Busy deployments are
+        never touched. A deployment holding the incoming port is always
+        stopped.
+        """
+        others = [
+            deployment_id
+            for deployment_id in self._loaded_in_group(group.id, snapshot)
+            if deployment_id != deployment.id
+        ]
+        target_endpoint = self.deployment_endpoint(deployment.id, group.id, snapshot, incoming=True)
+        stop = [
+            other
+            for other in others
+            if self.deployment_endpoint(other, group.id, snapshot) == target_endpoint
+        ]
+        if any(snapshot.deployments[item].active_request_ids for item in stop):
+            return None
+        sleep: list[str] = []
+
+        def lru(pool: list[str]) -> str:
+            return min(pool, key=lambda item: self._activity_key(snapshot.deployments[item]))
+
+        while not self._elastic_fits(
+            group, deployment, snapshot, stop=[*stop, *self_evict], sleep=sleep, waking=waking
+        ):
+            untouched = [item for item in others if item not in stop and item not in sleep]
+            idle_awake = [
+                item
+                for item in untouched
+                if snapshot.deployments[item].state == "ready"
+                and not snapshot.deployments[item].active_request_ids
+            ]
+            sleepable = [
+                item
+                for item in idle_awake
+                if self._can_sleep_on_evict(item, snapshot.deployments[item])
+            ]
+            if sleepable:
+                sleep.append(lru(sleepable))
+                continue
+            sleepers = [
+                item
+                for item in untouched
+                if snapshot.deployments[item].state == "sleeping"
+                and not snapshot.deployments[item].active_request_ids
+            ]
+            if sleepers:
+                stop.append(lru(sleepers))
+                continue
+            awake_pool = [*sleep, *idle_awake]
+            if not awake_pool:
+                return None
+            victim = lru(awake_pool)
+            if victim in sleep:
+                sleep.remove(victim)
+            stop.append(victim)
+        ordered_stop = [
+            *[item for item in stop if snapshot.deployments[item].state in SLEEP_STATES],
+            *[item for item in stop if snapshot.deployments[item].state not in SLEEP_STATES],
+        ]
+        return AdmissionPlan(stop=self._dedupe_ids([*ordered_stop, *self_evict]), sleep=sleep)
+
+    def _elastic_fits(
+        self,
+        group: GPUGroupConfig,
+        deployment: DeploymentConfig,
+        snapshot: RuntimeStateSnapshot,
+        *,
+        stop: list[str],
+        sleep: list[str],
+        waking: bool,
+    ) -> bool:
+        need = self.awake_footprint(deployment, group.id, snapshot)
+        in_group = {
+            deployment_id: state
+            for deployment_id, state in snapshot.deployments.items()
+            if state.gpu_group_id == group.id and state.loaded and deployment_id != deployment.id
+        }
+        reserved = sum(state.resident_memory_fraction for state in in_group.values())
+        reclaim = sum(in_group[item].resident_memory_fraction for item in stop if item in in_group)
+        for item in sleep:
+            if item in in_group:
+                residual = self.config.sleep_policy_for(item).sleeping_memory_fraction
+                reclaim += max(0.0, in_group[item].resident_memory_fraction - residual)
+        own = snapshot.deployments.get(deployment.id)
+        own_residual = (
+            own.resident_memory_fraction
+            if waking and own is not None and own.loaded and own.gpu_group_id == group.id
+            else 0.0
+        )
+        # Accounting: footprints of everything that stays must fit the budget.
+        if reserved - reclaim + need > group.usable_memory_fraction + 1e-9:
+            return False
+        # Physical: observed free memory (which also reflects processes outside
+        # Shardon) must cover the growth, keeping the unusable share free.
+        headroom = 1.0 - group.usable_memory_fraction
+        for gpu_id in group.gpu_ids:
+            observation = snapshot.gpu_observations.get(gpu_id)
+            if observation is None:
+                return False
+            free_fraction = observation.free_memory_mb / max(observation.total_memory_mb, 1)
+            if free_fraction + reclaim - (need - own_residual) < headroom - 1e-9:
+                return False
+        return True
+
     def deployment_endpoint(
         self,
         deployment_id: str,
@@ -371,16 +494,27 @@ class SchedulerEngine:
         incoming: bool = False,
     ) -> str:
         """host:port a deployment serves on; two deployments sharing one cannot
-        be co-resident (a sleeping process still holds its port)."""
-        _ = snapshot, incoming
+        be co-resident (a sleeping process still holds its port).
+
+        ``incoming`` describes a deployment about to start: with a backend
+        ``port_range`` it will get a fresh port, so it conflicts with nobody.
+        """
         deployment = self.config.deployments.get(deployment_id)
         backend = (
             self.config.backends.get(deployment.backend_runtime_id) if deployment else None
         )
-        if backend is None:
+        if deployment is None or backend is None:
             return f"unknown:{deployment_id}"
-        base_url = backend.resolved_for_gpu_group(gpu_group_id).base_url
-        return urlsplit(base_url).netloc.lower()
+        resolved = backend.resolved_for_gpu_group(gpu_group_id)
+        host = (urlsplit(resolved.base_url).hostname or "").lower()
+        state = snapshot.deployments.get(deployment_id)
+        if not incoming and state is not None and state.port is not None:
+            return f"{host}:{state.port}"
+        if deployment.port is not None:
+            return f"{host}:{deployment.port}"
+        if resolved.port_range is not None:
+            return f"allocated:{deployment_id}"
+        return urlsplit(resolved.base_url).netloc.lower()
 
     def _can_sleep_on_evict(self, deployment_id: str, state: DeploymentRuntimeState) -> bool:
         policy = self.config.sleep_policy_for(deployment_id)
@@ -577,6 +711,28 @@ class SchedulerEngine:
             and state.awake_memory_fraction is not None
         ):
             return state.awake_memory_fraction
+        group = self.config.gpu_groups.get(gpu_group_id)
+        if group is not None and group.memory_model == "elastic":
+            return self.elastic_footprint_estimate(deployment, gpu_group_id, state)
+        return deployment.memory_fraction_for_group(gpu_group_id)
+
+    @staticmethod
+    def elastic_footprint_estimate(
+        deployment: DeploymentConfig,
+        gpu_group_id: str,
+        state: DeploymentRuntimeState | None,
+    ) -> float:
+        """Resident footprint before observation: a footprint learned on an
+        earlier run in the same group, else ``resident_memory_fraction``, else
+        the deployment memory fraction."""
+        if (
+            state is not None
+            and state.learned_memory_fraction is not None
+            and state.learned_gpu_group_id == gpu_group_id
+        ):
+            return state.learned_memory_fraction
+        if deployment.resident_memory_fraction is not None:
+            return deployment.resident_memory_fraction
         return deployment.memory_fraction_for_group(gpu_group_id)
 
     def _can_switch(

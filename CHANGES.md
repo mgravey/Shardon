@@ -8,6 +8,9 @@
 - Bound sleepers with `gpu_groups.<id>.max_sleeping`, `max_sleeping_deployments` and `sleep.max_sleep_seconds`; the least recently used sleepers are stopped completely.
 - Add admin sleep/wake endpoints, per-deployment Sleep/Wake/Stop/Load buttons, and a public no-admin Sleep button on the activity board (idle, sleep-enabled deployments only). The router never proxies vLLM dev endpoints.
 - Add the vLLM sleep API to the `mock-vllm-v2` demo runtime (`--enable-sleep-mode`), with fault injection, plus process-level tests.
+- Add per-deployment ports (`port_range` on backends, `port` on deployments). Ports are allocated under the state lock, passed as `IGF_SHARDON_RUNTIME_PORT`, and released on stop.
+- Add `memory_model: elastic` GPU groups for kvcached co-residency. Admission uses resident footprints, learned from per-process `nvidia-smi` memory plus the kvcached reserve, together with observed free memory. Nothing is evicted when the new deployment fits; otherwise idle deployments are slept, then the least recently used are stopped. `static` groups are unchanged.
+- Add `kvcached` controls (`limit`, `limit_percent`, `min`, `priority`, `headroom`) applied with a configurable `kvctl`, a default `KVCACHED_IPC_NAME` of `igf-shardon-<deployment id>`, and live KV usage in the status APIs and the UI.
 
 ## 2026-10-14
 

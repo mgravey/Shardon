@@ -107,6 +107,18 @@ class DeploymentRuntimeState(BaseModel):
     woke_at: str | None = None
     awake_memory_fraction: float | None = None
     last_sleep_detail: dict[str, Any] = Field(default_factory=dict)
+    # Per-deployment port (backend port_range or deployment port); None means
+    # the backend base_url port is used unchanged.
+    port: int | None = None
+    kvcached_ipc_name: str | None = None
+    # Elastic memory: where resident_memory_fraction came from, and the
+    # per-process GPU memory observed for this deployment's process tree.
+    footprint_source: Literal["config", "estimate", "observed"] = "config"
+    observed_memory_mb: int | None = None
+    # Last observed awake footprint; survives unloads so the next admission
+    # in the same group starts from a measured value instead of an estimate.
+    learned_memory_fraction: float | None = None
+    learned_gpu_group_id: str | None = None
 
     @property
     def is_asleep(self) -> bool:
@@ -150,3 +162,5 @@ class RuntimeStateSnapshot(BaseModel):
     drains: dict[str, DrainState] = Field(default_factory=dict)
     gpu_observations: dict[str, GPUObservation] = Field(default_factory=dict)
     backend_health: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Live kvcached usage per deployment (from `kvctl list --json`).
+    kvcached_usage: dict[str, dict[str, Any]] = Field(default_factory=dict)

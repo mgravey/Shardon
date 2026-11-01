@@ -49,7 +49,14 @@ def create_app(runtime_label: str, *, enable_sleep_mode: bool = False) -> FastAP
 
     @app.get("/mock/stats")
     async def mock_stats() -> dict[str, object]:
-        return {**stats, **sleep_state, "pid": os.getpid()}
+        return {
+            **stats,
+            **sleep_state,
+            "pid": os.getpid(),
+            "deployment_id": os.environ.get("SHARDON_DEPLOYMENT_ID"),
+            "runtime_port": os.environ.get("IGF_SHARDON_RUNTIME_PORT"),
+            "kvcached_ipc_name": os.environ.get("KVCACHED_IPC_NAME"),
+        }
 
     if enable_sleep_mode:
 

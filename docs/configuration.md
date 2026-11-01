@@ -54,6 +54,21 @@ GPU groups accept `max_sleeping`, and `router.yaml` accepts
 `max_sleeping_deployments`, to stop the least recently used sleepers. See
 [Sleep mode and elastic memory](sleep-and-elastic-memory.md).
 
+## Ports, Elastic Groups and kvcached
+
+- Backends may declare `port_range: [first, last]`, and deployments a fixed
+  `port`. Shardon allocates a port per deployment, passes it to the launch
+  command as `IGF_SHARDON_RUNTIME_PORT`, and rewrites the deployment's
+  `base_url`. Single-port backends are unchanged.
+- GPU groups accept `memory_model: static | elastic` (default `static`).
+- Deployments accept `resident_memory_fraction`, the footprint estimate used
+  before the real footprint is observed.
+- Backends and deployments accept a `kvcached` block (`limit`, `limit_percent`,
+  `min`, `priority`, `headroom`, `kvctl_path`, `ipc_name`). Shardon applies it
+  with `kvctl` after readiness.
+
+See [Sleep mode and elastic memory](sleep-and-elastic-memory.md).
+
 ## Backend Inference Timeouts
 
 Add these optional settings to a canonical backend definition under

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import getpass
+import json
 import os
+import socket
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -10,6 +14,7 @@ from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from shardon_core.api.schemas import (
     AudioMultipartRequest,
@@ -29,7 +34,12 @@ from shardon_core.backends.base import (
 )
 from shardon_core.backends.registry import BackendRegistry
 from shardon_core.config.loader import load_repository_config
-from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig, SleepPolicy
+from shardon_core.config.schemas import (
+    DeploymentConfig,
+    KvcachedConfig,
+    RepositoryConfig,
+    SleepPolicy,
+)
 from shardon_core.config.writer import delete_yaml, ensure_symlink, write_yaml
 from shardon_core.gpu.provider import GPUProvider, MockGPUProvider, NvidiaSMIProvider
 from shardon_core.logging.events import EventLogger
@@ -45,6 +55,7 @@ from shardon_core.state.models import (
 )
 from shardon_core.state.ownership import RouterInstance
 from shardon_core.state.store import RuntimeStateStore
+from shardon_core.utils.process_tree import process_tree
 from shardon_core.utils.time import utc_now, utc_now_iso
 
 
@@ -53,6 +64,19 @@ class RuntimeOperationError(RuntimeError):
         super().__init__(message)
         self.detail = detail
         self.status_code = status_code
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    """Best-effort local check that nothing listens on ``host:port``."""
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            # Only a definite "in use" counts; remote/unbindable hosts cannot
+            # be checked locally and are left to the launch to report.
+            return exc.errno != errno.EADDRINUSE
+    return True
 
 
 class _RescheduleRequest(Exception):
@@ -312,6 +336,9 @@ class ShardonRuntime:
                     state.process_id = None
                     state.keep_free_killed_at = utc_now_iso()
                     state.active_request_ids = []
+                    state.resident_memory_fraction = 0.0
+                    self._release_launch_resources(state)
+                    self._clear_sleep_fields(state)
                     state.last_transition_reason = "keep_free enforcement"
                     self.event_logger.emit(
                         "keep_free.kill",
@@ -482,6 +509,7 @@ class ShardonRuntime:
                 payload = await self.backends.health(
                     deployment.backend_runtime_id,
                     gpu_group_id=selected_gpu_group_id,
+                    **({"port": runtime_state.port} if runtime_state.port is not None else {}),
                 )
                 results[deployment.id] = {
                     "ok": True,
@@ -1419,10 +1447,7 @@ class ShardonRuntime:
         observed_pid = self.snapshot().deployments[deployment.id].process_id
         recovery_attempts = 0
         while True:
-            adapter = self.backends.adapter_for(
-                deployment.backend_runtime_id,
-                gpu_group_id=target_gpu_group_id,
-            )
+            adapter = self._deployment_adapter(deployment, target_gpu_group_id)
             try:
                 result = await self._invoke_backend_request(
                     adapter,
@@ -1580,10 +1605,7 @@ class ShardonRuntime:
         usage_observer = StreamUsage()
         self._request_usage[request_id] = usage_observer.usage
         while True:
-            adapter = self.backends.adapter_for(
-                deployment.backend_runtime_id,
-                gpu_group_id=target_gpu_group_id,
-            )
+            adapter = self._deployment_adapter(deployment, target_gpu_group_id)
             try:
                 stream = (
                     adapter.stream_response(payload)
@@ -2081,7 +2103,14 @@ class ShardonRuntime:
         return self.config.sleep_policy_for(deployment_id)
 
     def _deployment_adapter(self, deployment: DeploymentConfig, gpu_group_id: str) -> Any:
-        return self.backends.adapter_for(deployment.backend_runtime_id, gpu_group_id=gpu_group_id)
+        """Adapter bound to the deployment's own port when one is allocated."""
+        state = self.snapshot().deployments.get(deployment.id)
+        port = state.port if state is not None else None
+        return self.backends.adapter_for(
+            deployment.backend_runtime_id,
+            gpu_group_id=gpu_group_id,
+            **({"port": port} if port is not None else {}),
+        )
 
     def _sleep_refusal(
         self,
@@ -2233,12 +2262,19 @@ class ShardonRuntime:
                         status_code=409,
                     ) from exc
             duration = round(time.monotonic() - started, 3)
+            residual_fraction = policy.sleeping_memory_fraction
+            try:
+                observed = self._observe_process_memory(deployment.id)
+            except Exception:
+                observed = None
+            if observed is not None:
+                residual_fraction = observed[0] / max(observed[1], 1)
             self.state_store.mutate(
                 lambda state: self._mark_sleeping(
                     state,
                     deployment.id,
                     level=policy.level,
-                    residual_fraction=policy.sleeping_memory_fraction,
+                    residual_fraction=residual_fraction,
                     reason=reason,
                     detail={
                         "level": policy.level,
@@ -2319,11 +2355,22 @@ class ShardonRuntime:
             sleep_ids=decision.should_sleep or [],
             reason=f"manual wake requested by {actor}",
         )
-        await self._ensure_awake(
-            deployment,
-            gpu_group_id=gpu_group_id,
-            reason=f"manual wake requested by {actor}",
-        )
+        try:
+            await self._ensure_awake(
+                deployment,
+                gpu_group_id=gpu_group_id,
+                reason=f"manual wake requested by {actor}",
+            )
+        except _RescheduleRequest as exc:
+            raise RuntimeOperationError(
+                "deployment was stopped while waking",
+                detail={
+                    "error": "deployment was stopped while waking",
+                    "deployment_id": deployment.id,
+                    "reason": str(exc),
+                },
+                status_code=409,
+            ) from exc
         self.event_logger.audit("runtime.wake", actor, deployment_id=deployment.id)
         return {"status": "ok", "deployment_id": deployment.id, "gpu_group_id": gpu_group_id}
 
@@ -2774,6 +2821,306 @@ class ShardonRuntime:
         runtime.slept_at = None
         runtime.awake_memory_fraction = None
 
+    # ------------------------------------------------------------------
+    # Per-deployment ports, elastic footprints and kvcached controls
+    # ------------------------------------------------------------------
+
+    def _assign_launch_resources(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment: DeploymentConfig,
+        gpu_group_id: str,
+    ) -> RuntimeStateSnapshot:
+        """Allocate the deployment port and kvcached IPC name before launch.
+
+        Runs inside a state mutation so concurrent starts (router and admin
+        processes) never receive the same port. Raises BackendOperationError
+        (aborting the mutation) when a port range is exhausted.
+        """
+        snapshot = self._seed_snapshot(snapshot)
+        runtime = snapshot.deployments[deployment.id]
+        backend = self.backends.resolve_backend(
+            deployment.backend_runtime_id, gpu_group_id=gpu_group_id
+        )
+        runtime.port = self._allocate_port(snapshot, deployment, backend)
+        kvcached = self.config.kvcached_for(deployment.id)
+        runtime.kvcached_ipc_name = (
+            (
+                backend.environment.get("KVCACHED_IPC_NAME")
+                or kvcached.ipc_name
+                or f"igf-shardon-{deployment.id}"
+            )
+            if kvcached is not None
+            else None
+        )
+        return snapshot
+
+    def _allocate_port(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment: DeploymentConfig,
+        backend: Any,
+    ) -> int | None:
+        if deployment.port is not None:
+            return deployment.port
+        if backend.port_range is None:
+            return None
+        held = {
+            state.port
+            for deployment_id, state in snapshot.deployments.items()
+            if deployment_id != deployment.id
+            and state.port is not None
+            and (state.loaded or state.state == "starting")
+        }
+        host = urlsplit(backend.base_url).hostname or "127.0.0.1"
+        first, last = backend.port_range
+        for port in range(first, last + 1):
+            if port not in held and _port_is_free(host, port):
+                return port
+        detail = {
+            "error": f"no free port in port_range {first}-{last}",
+            "deployment_id": deployment.id,
+            "backend_runtime_id": deployment.backend_runtime_id,
+            "held_ports": sorted(held),
+        }
+        self.event_logger.emit("backend.start_failed", "port allocation failed", **detail)
+        raise BackendOperationError("port allocation failed", detail=detail)
+
+    def _kvcached_launch_env(
+        self,
+        deployment: DeploymentConfig,
+        gpu_group_id: str,
+        launch_state: DeploymentRuntimeState,
+    ) -> dict[str, str]:
+        if launch_state.kvcached_ipc_name is None:
+            return {}
+        backend = self.backends.resolve_backend(
+            deployment.backend_runtime_id, gpu_group_id=gpu_group_id
+        )
+        if "KVCACHED_IPC_NAME" in backend.environment:
+            return {}  # an explicitly configured name is kept as-is
+        return {"KVCACHED_IPC_NAME": launch_state.kvcached_ipc_name}
+
+    @staticmethod
+    def _release_launch_resources(runtime: DeploymentRuntimeState) -> None:
+        runtime.port = None
+        runtime.kvcached_ipc_name = None
+        runtime.observed_memory_mb = None
+        runtime.footprint_source = "config"
+
+    async def _after_ready(self, deployment: DeploymentConfig, gpu_group_id: str) -> None:
+        """Post-readiness hooks. Never fail an otherwise healthy start."""
+        try:
+            await self.learn_footprint(deployment.id)
+        except Exception as exc:
+            self.event_logger.emit(
+                "deployment.footprint_failed",
+                "could not observe deployment footprint",
+                deployment_id=deployment.id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        try:
+            await self.apply_kvcached_controls(deployment.id)
+        except Exception as exc:
+            self.event_logger.emit(
+                "kvcached.apply_failed",
+                "could not apply kvcached controls",
+                deployment_id=deployment.id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _observe_process_memory(
+        self,
+        deployment_id: str,
+        *,
+        refresh: bool = True,
+    ) -> tuple[int, int, int] | None:
+        """(used MiB, group total MiB, per-GPU total MiB) for the deployment's
+        process tree from per-PID nvidia-smi data, or None when unobserved."""
+        snapshot = self.refresh_gpu_observations() if refresh else self.snapshot()
+        state = snapshot.deployments.get(deployment_id)
+        if state is None or state.process_id is None:
+            return None
+        group = self.config.gpu_groups.get(state.selected_gpu_group_id or state.gpu_group_id)
+        if group is None:
+            return None
+        observations = [snapshot.gpu_observations.get(gpu_id) for gpu_id in group.gpu_ids]
+        if not observations or any(item is None for item in observations):
+            return None
+        pids = process_tree(state.process_id)
+        used = 0
+        matched = False
+        for observation in observations:
+            for process in observation.observed_processes:
+                if process.pid in pids:
+                    used += process.memory_mb
+                    matched = True
+        if not matched:
+            return None
+        total = sum(item.total_memory_mb for item in observations)
+        return used, total, observations[0].total_memory_mb
+
+    async def learn_footprint(self, deployment_id: str) -> float | None:
+        """Elastic groups: resident footprint = observed weights/runtime memory
+        of the process tree + kvcached reserve (per-instance limit)."""
+        state = self.snapshot().deployments.get(deployment_id)
+        if state is None or not state.loaded or state.state != "ready":
+            return None
+        group_id = state.selected_gpu_group_id or state.gpu_group_id
+        group = self.config.gpu_groups.get(group_id)
+        if group is None or group.memory_model != "elastic":
+            return None
+        observed = self._observe_process_memory(deployment_id)
+        if observed is None:
+            return None
+        used_mb, total_mb, gpu_total_mb = observed
+        kvcached = self.config.kvcached_for(deployment_id)
+        reserve = kvcached.limit_fraction(gpu_total_mb * 1024 * 1024) if kvcached else 0.0
+        footprint = min(1.0, used_mb / max(total_mb, 1) + reserve)
+        pid = state.process_id
+
+        def apply(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+            runtime = snapshot.deployments.get(deployment_id)
+            if runtime is not None and runtime.process_id == pid and runtime.state == "ready":
+                runtime.resident_memory_fraction = footprint
+                runtime.footprint_source = "observed"
+                runtime.observed_memory_mb = used_mb
+                runtime.learned_memory_fraction = footprint
+                runtime.learned_gpu_group_id = group_id
+            return snapshot
+
+        self.state_store.mutate(apply)
+        self.event_logger.emit(
+            "deployment.footprint_observed",
+            "learned resident footprint from per-process GPU memory",
+            deployment_id=deployment_id,
+            gpu_group_id=group_id,
+            observed_memory_mb=used_mb,
+            kvcached_reserve_fraction=round(reserve, 4),
+            resident_memory_fraction=round(footprint, 4),
+        )
+        return footprint
+
+    async def refresh_elastic_footprints(self) -> None:
+        snapshot = self.snapshot()
+        for deployment_id, state in snapshot.deployments.items():
+            if state.loaded and state.state == "ready" and state.footprint_source == "estimate":
+                with contextlib.suppress(Exception):
+                    await self.learn_footprint(deployment_id)
+
+    async def _run_kvctl(self, kvcached: KvcachedConfig, *args: str) -> dict[str, Any]:
+        executable = kvcached.kvctl_path or "kvctl"
+        timeout = kvcached.command_timeout_seconds or 15.0
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            return {"ok": False, "error": f"cannot run {executable}: {exc}"}
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            return {"ok": False, "error": f"{executable} timed out after {timeout}s"}
+        result = {
+            "ok": process.returncode == 0,
+            "returncode": process.returncode,
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stderr": stderr.decode("utf-8", errors="replace").strip()[-2000:],
+        }
+        if not result["ok"]:
+            result["error"] = result["stderr"] or f"exit status {process.returncode}"
+        return result
+
+    async def apply_kvcached_controls(self, deployment_id: str) -> list[dict[str, Any]]:
+        kvcached = self.config.kvcached_for(deployment_id)
+        state = self.snapshot().deployments.get(deployment_id)
+        if kvcached is None or state is None or not state.kvcached_ipc_name:
+            return []
+        ipc = state.kvcached_ipc_name
+        commands: list[list[str]] = []
+        if kvcached.limit is not None:
+            commands.append(["limit", ipc, kvcached.limit])
+        elif kvcached.limit_percent is not None:
+            commands.append(["limit-percent", ipc, f"{kvcached.limit_percent:g}"])
+        if kvcached.min is not None:
+            commands.append(["min", ipc, kvcached.min])
+        if kvcached.priority is not None:
+            commands.append(["priority", ipc, str(kvcached.priority)])
+        if kvcached.headroom is not None:
+            commands.append(["headroom", ipc, kvcached.headroom])
+        results: list[dict[str, Any]] = []
+        for command in commands:
+            result = await self._run_kvctl(kvcached, *command)
+            results.append({"command": command, **result})
+            self.event_logger.emit(
+                "kvcached.applied" if result["ok"] else "kvcached.apply_failed",
+                "applied kvcached control" if result["ok"] else "kvcached control failed",
+                deployment_id=deployment_id,
+                ipc_name=ipc,
+                command=command,
+                error=result.get("error"),
+            )
+        return results
+
+    async def refresh_kvcached_usage(self) -> dict[str, dict[str, Any]]:
+        """Poll live kvcached usage (``kvctl list --json``) for loaded deployments."""
+        snapshot = self.snapshot()
+        by_executable: dict[str, tuple[KvcachedConfig, dict[str, str]]] = {}
+        for deployment_id, state in snapshot.deployments.items():
+            if not state.loaded or not state.kvcached_ipc_name:
+                continue
+            kvcached = self.config.kvcached_for(deployment_id)
+            if kvcached is None:
+                continue
+            key = kvcached.kvctl_path or "kvctl"
+            by_executable.setdefault(key, (kvcached, {}))[1][state.kvcached_ipc_name] = (
+                deployment_id
+            )
+        usage: dict[str, dict[str, Any]] = {}
+        checked_at = utc_now_iso()
+        for kvcached, ipcs in by_executable.values():
+            result = await self._run_kvctl(kvcached, "list", *ipcs, "--json")
+            entries: list[dict[str, Any]] = []
+            if result["ok"]:
+                try:
+                    parsed = json.loads(result["stdout"] or "[]")
+                    entries = [item for item in parsed if isinstance(item, dict)]
+                except (ValueError, TypeError):
+                    result = {"ok": False, "error": "kvctl list returned invalid JSON"}
+            for ipc, deployment_id in ipcs.items():
+                if not result["ok"]:
+                    usage[deployment_id] = {
+                        "ipc_name": ipc,
+                        "error": result.get("error"),
+                        "checked_at": checked_at,
+                    }
+                    continue
+                entry = next((item for item in entries if item.get("ipc") == ipc), None)
+                if entry is None and len(ipcs) == 1 and len(entries) == 1:
+                    entry = entries[0]
+                usage[deployment_id] = {
+                    "ipc_name": ipc,
+                    "active": entry is not None,
+                    "used_bytes": entry.get("used_bytes") if entry else None,
+                    "limit_bytes": entry.get("limit_bytes") if entry else None,
+                    "gpus": entry.get("gpus", []) if entry else [],
+                    "checked_at": checked_at,
+                }
+        if usage or snapshot.kvcached_usage:
+
+            def store(state: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+                state.kvcached_usage = usage
+                return state
+
+            self.state_store.mutate(store)
+        return usage
+
     def _reconcile_loaded_processes(self, snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
         for deployment_id, runtime_state in snapshot.deployments.items():
@@ -2957,9 +3304,21 @@ class ShardonRuntime:
                 }
                 self.event_logger.emit("backend.start_failed", "GPU preflight failed", **detail)
                 raise BackendOperationError("GPU preflight failed", detail=detail)
+            launch = self.state_store.mutate(
+                lambda state: self._assign_launch_resources(
+                    state, deployment, selected_gpu_group_id
+                )
+            ).deployments[deployment.id]
+            launch_kwargs: dict[str, Any] = {}
+            if launch.port is not None:
+                launch_kwargs["port"] = launch.port
+            extra_env = self._kvcached_launch_env(deployment, selected_gpu_group_id, launch)
+            if extra_env:
+                launch_kwargs["extra_env"] = extra_env
             readiness = await self.backends.ensure_started_and_ready(
                 deployment,
                 gpu_group_id=selected_gpu_group_id,
+                **launch_kwargs,
             )
         except BackendOperationError as exc:
             readiness_detail = exc.detail
@@ -2994,6 +3353,7 @@ class ShardonRuntime:
                 readiness_detail=readiness,
             )
         )
+        await self._after_ready(deployment, selected_gpu_group_id)
 
     def _mark_loaded(
         self,
@@ -3015,7 +3375,17 @@ class ShardonRuntime:
         runtime.loaded_at = utc_now_iso()
         runtime.readiness_passed_at = readiness_detail.get("ready_at", utc_now_iso())
         runtime.process_id = pid
-        runtime.resident_memory_fraction = deployment.memory_fraction_for_group(selected_gpu_group_id)
+        group = self.config.gpu_groups.get(selected_gpu_group_id)
+        if group is not None and group.memory_model == "elastic":
+            runtime.resident_memory_fraction = self.scheduler.elastic_footprint_estimate(
+                deployment, selected_gpu_group_id, runtime
+            )
+            runtime.footprint_source = "estimate"
+        else:
+            runtime.resident_memory_fraction = deployment.memory_fraction_for_group(
+                selected_gpu_group_id
+            )
+            runtime.footprint_source = "config"
         runtime.current_model_name = deployment.api_model_name
         runtime.last_error = None
         runtime.last_transition_reason = reason
@@ -3064,6 +3434,7 @@ class ShardonRuntime:
         runtime.last_error = detail.get("error")
         runtime.last_transition_reason = reason
         runtime.last_readiness_detail = detail
+        self._release_launch_resources(runtime)
         self._clear_sleep_fields(runtime)
         return snapshot
 
@@ -3087,6 +3458,7 @@ class ShardonRuntime:
             runtime.active_request_ids = []
         runtime.last_error = error
         runtime.last_transition_reason = reason
+        self._release_launch_resources(runtime)
         self._clear_sleep_fields(runtime)
         return snapshot
 
@@ -3106,6 +3478,7 @@ class ShardonRuntime:
         runtime.resident_memory_fraction = 0.0
         runtime.active_request_ids = []
         runtime.last_transition_reason = reason
+        self._release_launch_resources(runtime)
         self._clear_sleep_fields(runtime)
         return snapshot
 
@@ -3316,10 +3689,7 @@ class ShardonRuntime:
             gpu_group_id=selected_gpu_group_id,
             reason=f"batch {job.id}",
         )
-        adapter = self.backends.adapter_for(
-            deployment.backend_runtime_id,
-            gpu_group_id=selected_gpu_group_id,
-        )
+        adapter = self._deployment_adapter(deployment, selected_gpu_group_id)
         state = self.state_store.mutate(
             lambda state: self._mark_batch_running(state, job.id, deployment.id)
         )
@@ -3658,6 +4028,7 @@ class ShardonRuntime:
             "gpu_groups": self._group_runtime_status(snapshot),
             "backend_health": snapshot.backend_health,
             "deployment_capabilities": self._deployment_capability_status(),
+            "kvcached_usage": snapshot.kvcached_usage,
             "sleep_policies": {
                 deployment_id: self.sleep_policy(deployment_id).model_dump(mode="json")
                 for deployment_id in self.config.deployments
