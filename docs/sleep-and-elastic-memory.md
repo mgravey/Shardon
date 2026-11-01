@@ -130,8 +130,8 @@ transiently; prefer leaving `sleep.enabled` false instead.
 
 | Where | Control | Who |
 | --- | --- | --- |
-| Public activity board | **Sleep** button on an idle, sleep-enabled deployment | Anyone, no admin sign-in |
-| Admin runtime table | **Sleep**, **Wake**, **Stop**, **Load** per deployment | Admin |
+| Public activity board | **Sleep** button, shown only while the deployment is awake with nothing in flight, queued or batched (`can_sleep` in `/runtime/activity`) | Anyone, no admin sign-in |
+| Admin runtime table | **Sleep**, **Wake**, **Stop**, **Load** per deployment (Stop is admin-only) | Admin |
 | `POST /runtime/activity/deployments/{id}/sleep` | Sleep (public) | No auth |
 | `POST /runtime/sleep/{id}` and `/runtime/wake/{id}` | Sleep and wake | Admin token |
 | `POST /runtime/unload/{id}` | Stop completely (works on sleeping deployments) | Admin token |
@@ -144,20 +144,25 @@ sleeps are audited with the caller's address.
 ## Per-Deployment Ports
 
 By default, every deployment of a backend shares the backend `base_url` port,
-so two of them can never run at the same time. To co-host them, give the
-backend a port range, or give a deployment a fixed port:
+so two of them can never run at the same time. To co-host them, let Shardon give
+each deployment its own port:
 
 ```yaml
-# backend
+# backend: start at the current base_url port, then +1 for each extra deployment
 base_url: http://127.0.0.1:8100   # host and path are kept; the port is replaced
-port_range: [8100, 8109]          # inclusive
+per_deployment_ports: true        # first deployment 8100, next 8101, 8102, ...
+max_deployment_ports: 16          # optional, default 16 (8100-8115)
 
-# deployment (optional; wins over the backend range)
+# or an explicit inclusive range instead
+port_range: [8100, 8109]
+
+# deployment (optional; wins over the backend settings)
 port: 8120
 ```
 
-- At start, Shardon allocates the lowest port in the range that no loaded or
-  starting deployment holds and that is not already bound. The allocation is
+- At start, Shardon allocates the lowest port that no loaded or starting
+  deployment holds and that is not already bound. The first deployment
+  therefore keeps the current port, and each additional one gets the next port. The allocation is
   made inside the state-file lock, so the admin and router processes never hand
   out the same port.
 - The port is passed to the launch command as `IGF_SHARDON_RUNTIME_PORT` (also
@@ -168,7 +173,8 @@ port: 8120
 - The port is released when the deployment stops or fails to start. A sleeping
   deployment keeps its port.
 - An exhausted range fails the start with `no free port in port_range`.
-- Backends without `port_range` or `port` keep working exactly as before.
+- Backends without `per_deployment_ports`, `port_range` or `port` keep working
+  exactly as before.
 
 ## Elastic Groups (kvcached Co-Residency)
 
@@ -260,8 +266,8 @@ backend_type: vllm
 version: 0.30.0
 display_name: vLLM 0.30 + kvcached
 runtime_dir: /opt/igf/vllm-stable
-base_url: http://127.0.0.1:8100
-port_range: [8100, 8109]
+base_url: http://127.0.0.1:8100   # the current port; extra deployments get 8101, 8102, ...
+per_deployment_ports: true
 launch_command: [/opt/igf/vllm-stable/launch.sh]  # vllm serve ... --port "$IGF_SHARDON_RUNTIME_PORT" --enable-sleep-mode
 health_path: /v1/models
 environment:
@@ -290,6 +296,6 @@ kvcached:
 max_sleeping_deployments: 3
 ```
 
-Migrating from the current single-port setup: add `port_range` and make the
-launcher honour `IGF_SHARDON_RUNTIME_PORT`. Then switch the group to `elastic`.
+Migrating from the current single-port setup: add `per_deployment_ports: true`
+and make the launcher honour `IGF_SHARDON_RUNTIME_PORT`. Then switch the group to `elastic`.
 Until the group is switched, it keeps its `static` behaviour.

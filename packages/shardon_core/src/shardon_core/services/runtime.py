@@ -54,6 +54,7 @@ from shardon_core.state.models import (
     RuntimeStateSnapshot,
 )
 from shardon_core.state.ownership import RouterInstance
+from shardon_core.state.sleep_rules import sleep_refusal
 from shardon_core.state.store import RuntimeStateStore
 from shardon_core.utils.process_tree import process_tree
 from shardon_core.utils.time import utc_now, utc_now_iso
@@ -2119,32 +2120,7 @@ class ShardonRuntime:
         *,
         require_idle: bool,
     ) -> str | None:
-        runtime = snapshot.deployments.get(deployment.id)
-        if runtime is None or not runtime.loaded:
-            return "deployment is not loaded"
-        if runtime.state == "sleeping":
-            return "already sleeping"
-        if runtime.state != "ready":
-            return f"deployment is {runtime.state}"
-        if runtime.active_request_ids:
-            return "deployment is serving requests"
-        if not require_idle:
-            return None
-        for request in snapshot.queued_requests:
-            if request.status != "queued":
-                continue
-            if request.deployment_id == deployment.id or (
-                not request.deployment_id and request.model_name == deployment.api_model_name
-            ):
-                return "requests are queued for this deployment"
-        for job in snapshot.batch_jobs.values():
-            if job.status not in {"queued", "running"}:
-                continue
-            if job.deployment_id == deployment.id or (
-                job.deployment_id is None and job.model_name == deployment.api_model_name
-            ):
-                return "batch work targets this deployment"
-        return None
+        return sleep_refusal(snapshot, deployment, require_idle=require_idle)
 
     async def sleep_deployment(
         self,
@@ -2863,7 +2839,8 @@ class ShardonRuntime:
     ) -> int | None:
         if deployment.port is not None:
             return deployment.port
-        if backend.port_range is None:
+        port_range = backend.effective_port_range()
+        if port_range is None:
             return None
         held = {
             state.port
@@ -2873,7 +2850,7 @@ class ShardonRuntime:
             and (state.loaded or state.state == "starting")
         }
         host = urlsplit(backend.base_url).hostname or "127.0.0.1"
-        first, last = backend.port_range
+        first, last = port_range
         for port in range(first, last + 1):
             if port not in held and _port_is_free(host, port):
                 return port

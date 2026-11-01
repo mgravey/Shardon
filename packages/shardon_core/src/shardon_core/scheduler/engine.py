@@ -497,7 +497,8 @@ class SchedulerEngine:
         be co-resident (a sleeping process still holds its port).
 
         ``incoming`` describes a deployment about to start: with a backend
-        ``port_range`` it will get a fresh port, so it conflicts with nobody.
+        port range (``port_range`` or ``per_deployment_ports``) it will get a
+        fresh port, so it conflicts with nobody.
         """
         deployment = self.config.deployments.get(deployment_id)
         backend = (
@@ -512,7 +513,7 @@ class SchedulerEngine:
             return f"{host}:{state.port}"
         if deployment.port is not None:
             return f"{host}:{deployment.port}"
-        if resolved.port_range is not None:
+        if resolved.effective_port_range() is not None:
             return f"allocated:{deployment_id}"
         return urlsplit(resolved.base_url).netloc.lower()
 

@@ -429,3 +429,24 @@ def test_wake_in_elastic_group_reclaims_memory_from_idle_peers(tmp_path, runtime
     assert state["dep-b"].state == "sleeping"  # the LRU idle peer made room
     assert state["dep-c"].state == "ready"
     assert mock_stats(runtime, "dep-a")["inference_while_sleeping"] == 0
+
+
+def test_per_deployment_ports_start_at_base_url_port_and_increment(tmp_path, runtimes) -> None:
+    first, _ = _free_port_range(3)
+    backend = mock_backend("vllm-pool", port=first, per_deployment_ports=True)
+    runtime = _runtime(
+        tmp_path,
+        runtimes,
+        backends=[backend],
+        deployments=[
+            deployment(name, "vllm-pool", resident_memory_fraction=0.3)
+            for name in ("dep-a", "dep-b", "dep-c")
+        ],
+    )
+    assert runtime.config.backends["vllm-pool"].effective_port_range() == (first, first + 15)
+    for name in ("dep-a", "dep-b", "dep-c"):
+        asyncio.run(runtime.load_deployment(deployment_id=name, actor="test"))
+    state = runtime.snapshot().deployments
+    ports = {name: state[name].port for name in ("dep-a", "dep-b", "dep-c")}
+    assert ports == {"dep-a": first, "dep-b": first + 1, "dep-c": first + 2}
+    assert mock_stats(runtime, "dep-b")["runtime_port"] == str(first + 1)

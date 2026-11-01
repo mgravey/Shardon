@@ -71,6 +71,39 @@ def test_admin_and_public_sleep_controls(repo) -> None:
         headers = {"Authorization": f"Bearer {token}"}
         assert client.post("/runtime/load/dep-a", headers=headers).status_code == 200
 
+        def can_sleep() -> dict[str, bool]:
+            activity = client.get("/runtime/activity").json()
+            return {d["id"]: d["can_sleep"] for m in activity["models"] for d in m["deployments"]}
+
+        # The public Sleep button is only offered while awake and idle.
+        assert can_sleep() == {"dep-a": True, "dep-plain": False}
+        from shardon_core.state.models import ActiveRequest
+        from shardon_core.utils.time import utc_now_iso
+
+        waiting = ActiveRequest(
+            id="req-wait", user_name="u", api_key_id="k", deployment_id="",
+            backend_runtime_id="", gpu_group_id="", request_class="interactive",
+            model_name="model-dep-a", status="queued", priority=100, created_at=utc_now_iso(),
+        )
+        runtime.state_store.mutate(lambda state: runtime._enqueue_request(state, waiting))
+        assert can_sleep()["dep-a"] is False
+        assert client.post("/runtime/activity/deployments/dep-a/sleep").status_code == 409
+        runtime.state_store.mutate(lambda state: runtime._dequeue_request(state, "req-wait"))
+
+        def in_flight(state):
+            state.deployments["dep-a"].active_request_ids = ["req-live"]
+            return state
+
+        runtime.state_store.mutate(in_flight)
+        assert can_sleep()["dep-a"] is False
+
+        def done(state):
+            state.deployments["dep-a"].active_request_ids = []
+            return state
+
+        runtime.state_store.mutate(done)
+        assert can_sleep()["dep-a"] is True
+
         # Public sleep: no admin token needed.
         public = client.post("/runtime/activity/deployments/dep-a/sleep")
         assert public.status_code == 200, public.text
@@ -81,6 +114,7 @@ def test_admin_and_public_sleep_controls(repo) -> None:
         rows = {d["id"]: d for m in activity["models"] for d in m["deployments"]}
         assert rows["dep-a"]["state"] == "sleeping"
         assert rows["dep-a"]["sleep_enabled"] is True
+        assert rows["dep-a"]["can_sleep"] is False  # already asleep
         assert rows["dep-plain"]["sleep_enabled"] is False
 
         status = client.get("/runtime/status", headers=headers).json()

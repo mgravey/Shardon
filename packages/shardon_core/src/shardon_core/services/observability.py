@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from shardon_core.config.schemas import RepositoryConfig
 from shardon_core.state.models import ActiveRequest, RuntimeStateSnapshot
+from shardon_core.state.sleep_rules import sleep_refusal
 from shardon_core.utils.files import append_jsonl, locked_file
 from shardon_core.utils.time import utc_now
 
@@ -369,6 +370,9 @@ class ActivityDeployment(BaseModel):
     state: str
     gpu_group_id: str | None
     sleep_enabled: bool = False
+    # True only when the public Sleep control would be accepted right now:
+    # awake, nothing in flight, nothing queued, no batch work.
+    can_sleep: bool = False
     slept_at: str | None = None
     port: int | None = None
     kv_used_bytes: int | None = None
@@ -450,6 +454,8 @@ def activity_snapshot(
                     else None
                 ),
                 sleep_enabled=config.sleep_policy_for(deployment.id).enabled,
+                can_sleep=config.sleep_policy_for(deployment.id).enabled
+                and sleep_refusal(snapshot, deployment, require_idle=True) is None,
                 slept_at=state.slept_at if state else None,
                 port=state.port if state else None,
                 kv_used_bytes=snapshot.kvcached_usage.get(deployment.id, {}).get("used_bytes"),

@@ -7,7 +7,7 @@ type RequestActivity = {
 };
 type DeploymentActivity = {
   id: string; state: string; gpu_group_id: string | null;
-  sleep_enabled?: boolean; slept_at?: string | null;
+  sleep_enabled?: boolean; can_sleep?: boolean; slept_at?: string | null;
   port?: number | null; kv_used_bytes?: number | null; kv_limit_bytes?: number | null;
 };
 const kvTitle = (d: DeploymentActivity) => typeof d.kv_used_bytes === "number"
@@ -98,7 +98,9 @@ async function requestPublicSleep(deploymentId: string): Promise<string> {
 
 function SleepButton({ deployment, onResult }: { deployment: DeploymentActivity; onResult: (message: string) => void }) {
   const [busy, setBusy] = useState(false);
-  if (!deployment.sleep_enabled || deployment.state !== "ready") return null;
+  // Only offered while the model is awake and idle: nothing in flight,
+  // nothing waiting, no batch work (computed server-side as can_sleep).
+  if (!deployment.can_sleep) return null;
   return <button className="secondary chip-action" disabled={busy}
     title="Release this model's GPU memory now. It keeps its process and wakes on the next request."
     onClick={event => {

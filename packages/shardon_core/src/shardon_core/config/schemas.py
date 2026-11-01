@@ -206,6 +206,11 @@ class BackendRuntimeConfig(BaseModel):
     # The allocated port replaces the base_url port and is passed to the
     # launch command as IGF_SHARDON_RUNTIME_PORT. Unset: single shared port.
     port_range: tuple[int, int] | None = None
+    # Simpler alternative to port_range: the first deployment gets the
+    # base_url port, the next one that port + 1, and so on (lowest free port
+    # first, up to max_deployment_ports ports).
+    per_deployment_ports: bool = False
+    max_deployment_ports: int = Field(default=16, ge=1, le=1024)
 
     @field_validator("port_range")
     @classmethod
@@ -213,6 +218,16 @@ class BackendRuntimeConfig(BaseModel):
         if value is not None and not (1 <= value[0] <= value[1] <= 65535):
             raise ValueError("port_range must be [first, last] with 1 <= first <= last <= 65535")
         return value
+
+    def effective_port_range(self) -> tuple[int, int] | None:
+        """Inclusive port range for per-deployment ports, or None (shared port)."""
+        if self.port_range is not None:
+            return self.port_range
+        if not self.per_deployment_ports:
+            return None
+        parts = urlsplit(self.base_url)
+        base_port = parts.port or (443 if parts.scheme == "https" else 80)
+        return base_port, min(65535, base_port + self.max_deployment_ports - 1)
 
     def with_port(self, port: int | None) -> BackendRuntimeConfig:
         """Return a copy whose base_url targets ``port`` (no-op for None)."""

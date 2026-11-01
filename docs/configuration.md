@@ -56,8 +56,9 @@ GPU groups accept `max_sleeping`, and `router.yaml` accepts
 
 ## Ports, Elastic Groups and kvcached
 
-- Backends may declare `port_range: [first, last]`, and deployments a fixed
-  `port`. Shardon allocates a port per deployment, passes it to the launch
+- Backends may declare `per_deployment_ports: true` (start at the `base_url`
+  port and add 1 for each extra deployment) or `port_range: [first, last]`, and
+  deployments a fixed `port`. Shardon allocates a port per deployment, passes it to the launch
   command as `IGF_SHARDON_RUNTIME_PORT`, and rewrites the deployment's
   `base_url`. Single-port backends are unchanged.
 - GPU groups accept `memory_model: static | elastic` (default `static`).

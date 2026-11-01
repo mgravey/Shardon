@@ -49,7 +49,9 @@ def mock_backend(
 ) -> dict[str, Any]:
     port = port or free_port()
     command = [sys.executable, str(MOCK_LAUNCHER), "--runtime-label", backend_id]
-    if "port_range" not in extra:
+    if "port_range" not in extra and not extra.get("per_deployment_ports"):
+        # Without per-deployment ports the launcher listens on the fixed port;
+        # otherwise it reads IGF_SHARDON_RUNTIME_PORT.
         command += ["--port", str(port)]
     if enable_sleep_mode:
         command.append("--enable-sleep-mode")
