@@ -45,6 +45,15 @@ Shardon now treats symlinks as the default operational model: enabled entries sh
 - GPU groups define scheduling targets, usable memory fraction, and `keep_free`.
 - Backends may use `gpu_group_overrides` for per-group launch command, base URL, environment, and health/readiness settings while keeping one backend definition.
 
+## Sleep Mode (vLLM)
+
+Backends may declare an optional `sleep` block; deployments may override any of
+its fields. It is off by default. Idle deployments sleep after `idle_seconds`
+(default 600), wake on demand, and fall back to a cold restart if a wake fails.
+GPU groups accept `max_sleeping`, and `router.yaml` accepts
+`max_sleeping_deployments`, to stop the least recently used sleepers. See
+[Sleep mode and elastic memory](sleep-and-elastic-memory.md).
+
 ## Backend Inference Timeouts
 
 Add these optional settings to a canonical backend definition under

@@ -231,6 +231,67 @@ class BackendAdapter(ABC):
                     payload["body"] = body_text
                 return payload
 
+    # ------------------------------------------------------------------
+    # vLLM sleep-mode control endpoints (requires --enable-sleep-mode and
+    # VLLM_SERVER_DEV_MODE=1). Only the control plane calls these; the router
+    # never proxies them from clients.
+    # ------------------------------------------------------------------
+
+    async def _control_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float,
+        params: list[tuple[str, str]] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=self.backend.request_connect_timeout_seconds)
+        ) as client:
+            response = await client.request(
+                method,
+                f"{self.backend.base_url}{path}",
+                params=params,
+                json=json_body,
+            )
+            response.raise_for_status()
+            return response
+
+    async def sleep(self, *, level: int, mode: str, timeout: float) -> None:
+        await self._control_request(
+            "POST",
+            "/sleep",
+            timeout=timeout,
+            params=[("level", str(level)), ("mode", mode)],
+        )
+
+    async def wake_up(self, *, tags: list[str] | None = None, timeout: float) -> None:
+        await self._control_request(
+            "POST",
+            "/wake_up",
+            timeout=timeout,
+            params=[("tags", tag) for tag in tags or []] or None,
+        )
+
+    async def collective_rpc(self, method: str, *, timeout: float) -> None:
+        await self._control_request(
+            "POST",
+            "/collective_rpc",
+            timeout=timeout,
+            json_body={"method": method},
+        )
+
+    async def is_sleeping(self, *, timeout: float = 10.0) -> bool:
+        response = await self._control_request("GET", "/is_sleeping", timeout=timeout)
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("is_sleeping"), bool):
+            raise BackendOperationError(
+                "unexpected /is_sleeping response",
+                detail={"error": "unexpected /is_sleeping response", "payload": payload},
+            )
+        return payload["is_sleeping"]
+
     @abstractmethod
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError

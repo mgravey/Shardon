@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import getpass
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import aclosing, asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,13 +29,14 @@ from shardon_core.backends.base import (
 )
 from shardon_core.backends.registry import BackendRegistry
 from shardon_core.config.loader import load_repository_config
-from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig
+from shardon_core.config.schemas import DeploymentConfig, RepositoryConfig, SleepPolicy
 from shardon_core.config.writer import delete_yaml, ensure_symlink, write_yaml
 from shardon_core.gpu.provider import GPUProvider, MockGPUProvider, NvidiaSMIProvider
 from shardon_core.logging.events import EventLogger
 from shardon_core.scheduler.engine import SchedulerEngine, SchedulingDecision, SchedulingRequest
 from shardon_core.services.observability import StreamUsage, TokenUsage, UsageStore, extract_usage
 from shardon_core.state.models import (
+    SLEEP_STATES,
     ActiveRequest,
     BatchJobState,
     DeploymentRuntimeState,
@@ -50,6 +53,14 @@ class RuntimeOperationError(RuntimeError):
         super().__init__(message)
         self.detail = detail
         self.status_code = status_code
+
+
+class _RescheduleRequest(Exception):
+    """Internal signal: the scheduling decision went stale; schedule again.
+
+    The request is still queued when this is raised, so the routing loop can
+    simply retry within the same interactive deadline.
+    """
 
 
 class ShardonRuntime:
@@ -84,6 +95,7 @@ class ShardonRuntime:
         self.scheduler = SchedulerEngine(self.config)
         self.backends = BackendRegistry(self.config, self.state_root, self.event_logger)
         self._deployment_locks: dict[str, asyncio.Lock] = {}
+        self._wake_tasks: dict[str, asyncio.Task[None]] = {}
         self.service_user = getpass.getuser()
         self.state_store.mutate(self._reconcile_loaded_processes)
 
@@ -382,7 +394,9 @@ class ShardonRuntime:
     ) -> list[tuple[DeploymentConfig, DeploymentRuntimeState]]:
         loaded: list[tuple[DeploymentConfig, DeploymentRuntimeState]] = []
         for deployment_id, runtime in snapshot.deployments.items():
-            if not runtime.loaded or runtime.state != "ready":
+            if not runtime.loaded or (
+                runtime.state != "ready" and runtime.state not in SLEEP_STATES
+            ):
                 continue
             deployment = self.config.deployments.get(deployment_id)
             if deployment is None or not deployment.enabled:
@@ -450,14 +464,28 @@ class ShardonRuntime:
                     "gpu_group_id": selected_gpu_group_id,
                 }
                 continue
+            if runtime_state.state in {"falling_asleep", "waking", "stopping"}:
+                # Mid-transition: never probe-and-invalidate a process that a
+                # lifecycle operation is actively driving.
+                results[deployment.id] = {
+                    "ok": True,
+                    "status": runtime_state.state,
+                    "checked_at": utc_now_iso(),
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": selected_gpu_group_id,
+                }
+                continue
             try:
+                # The health path (e.g. /v1/models) does not wake a sleeping
+                # vLLM server and is not recorded as activity.
                 payload = await self.backends.health(
                     deployment.backend_runtime_id,
                     gpu_group_id=selected_gpu_group_id,
                 )
                 results[deployment.id] = {
                     "ok": True,
-                    "status": "ready",
+                    "status": "sleeping" if runtime_state.state == "sleeping" else "ready",
                     "checked_at": utc_now_iso(),
                     "deployment_id": deployment.id,
                     "backend_runtime_id": deployment.backend_runtime_id,
@@ -601,6 +629,8 @@ class ShardonRuntime:
             and (gpu_group_id is None or gpu_group_id == selected_gpu_group_id)
             and not self.scheduler.unavailable_gpu_ids(selected_gpu_group_id, snapshot)
         ):
+            if runtime_state.state in SLEEP_STATES:
+                return await self.wake_deployment(deployment.id, actor=actor)
             return {
                 "status": "ok",
                 "detail": "deployment already loaded",
@@ -648,7 +678,11 @@ class ShardonRuntime:
                 status_code=409,
             )
         evict_ids = decision.should_evict or []
-        self._prepare_group_for_load(evict_ids, reason=f"manual load requested by {actor}")
+        await self._prepare_group_for_load(
+            evict_ids,
+            sleep_ids=decision.should_sleep or [],
+            reason=f"manual load requested by {actor}",
+        )
         await self._start_and_mark_ready(
             deployment,
             selected_gpu_group_id=decision.gpu_group_id,
@@ -1096,7 +1130,10 @@ class ShardonRuntime:
                 if any(
                     snapshot.deployments.get(deployment_id)
                     and snapshot.deployments[deployment_id].active_request_ids
-                    for deployment_id in (decision.should_evict or [])
+                    for deployment_id in [
+                        *(decision.should_evict or []),
+                        *(decision.should_sleep or []),
+                    ]
                 ):
                     await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
                     continue
@@ -1113,9 +1150,15 @@ class ShardonRuntime:
                         ),
                         should_evict=decision.should_evict or [],
                         uploaded_file=uploaded_file,
+                        should_sleep=decision.should_sleep or [],
+                        should_wake=decision.should_wake,
+                        deadline=deadline,
                     )
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
                     return response
+                except _RescheduleRequest:
+                    await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
+                    continue
                 except RuntimeOperationError as exc:
                     diagnostic = exc.detail
                     self.state_store.mutate(
@@ -1275,7 +1318,10 @@ class ShardonRuntime:
                 if any(
                     snapshot.deployments.get(deployment_id)
                     and snapshot.deployments[deployment_id].active_request_ids
-                    for deployment_id in (decision.should_evict or [])
+                    for deployment_id in [
+                        *(decision.should_evict or []),
+                        *(decision.should_sleep or []),
+                    ]
                 ):
                     await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
                     continue
@@ -1292,12 +1338,18 @@ class ShardonRuntime:
                                 decision.gpu_group_id or deployment.preferred_gpu_group_id()
                             ),
                             should_evict=decision.should_evict or [],
+                            should_sleep=decision.should_sleep or [],
+                            should_wake=decision.should_wake,
+                            deadline=deadline,
                         )
                     ) as stream:
                         async for chunk in stream:
                             yield chunk
                     self.state_store.mutate(lambda state: self._dequeue_request(state, request_id))
                     return
+                except _RescheduleRequest:
+                    await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
+                    continue
                 except RuntimeOperationError as exc:
                     diagnostic = exc.detail
                     self.state_store.mutate(
@@ -1342,53 +1394,19 @@ class ShardonRuntime:
         target_gpu_group_id: str,
         should_evict: list[str],
         uploaded_file: UploadedFilePayload | None,
+        should_sleep: list[str] | None = None,
+        should_wake: bool = False,
+        deadline: float | None = None,
     ) -> Any:
-        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
-        current = snapshot.deployments.get(deployment.id)
-        current_gpu_group_id = (
-            (current.selected_gpu_group_id or current.gpu_group_id)
-            if current is not None
-            else None
+        await self._prepare_dispatch(
+            deployment=deployment,
+            request_id=request_id,
+            target_gpu_group_id=target_gpu_group_id,
+            should_evict=should_evict,
+            should_sleep=should_sleep,
+            should_wake=should_wake,
+            deadline=deadline,
         )
-        should_start = (
-            current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
-        )
-        planned_evictions = list(should_evict)
-        if (
-            current is not None
-            and current.loaded
-            and current_gpu_group_id is not None
-            and current_gpu_group_id != target_gpu_group_id
-        ):
-            if current.active_request_ids:
-                raise RuntimeOperationError(
-                    "deployment is busy and cannot switch gpu group",
-                    detail={
-                        "error": "deployment is busy and cannot switch gpu group",
-                        "deployment_id": deployment.id,
-                        "current_gpu_group_id": current_gpu_group_id,
-                        "target_gpu_group_id": target_gpu_group_id,
-                        "active_request_ids": current.active_request_ids,
-                    },
-                    status_code=409,
-                )
-            planned_evictions.append(deployment.id)
-        self._update_request_observation(
-            request_id,
-            phase="loading" if should_start else "waiting",
-            wait_reason="Loading model" if should_start else "Waiting for backend dispatch",
-            deployment_id=deployment.id,
-            backend_runtime_id=deployment.backend_runtime_id,
-            gpu_group_id=target_gpu_group_id,
-        )
-        if should_start:
-            planned_evictions = list(dict.fromkeys(planned_evictions))
-            self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
-            await self._start_and_mark_ready(
-                deployment,
-                selected_gpu_group_id=target_gpu_group_id,
-                reason=f"routing request {request_id}",
-            )
         self.state_store.mutate(
             lambda state: self._mark_request_running(
                 state,
@@ -1528,6 +1546,9 @@ class ShardonRuntime:
         auth: AuthResult,
         target_gpu_group_id: str,
         should_evict: list[str],
+        should_sleep: list[str] | None = None,
+        should_wake: bool = False,
+        deadline: float | None = None,
     ) -> AsyncIterator[bytes]:
         if task not in {"response", "completion"}:
             raise RuntimeOperationError(
@@ -1535,52 +1556,15 @@ class ShardonRuntime:
                 detail={"error": "unsupported streaming task", "task": task},
                 status_code=409,
             )
-        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
-        current = snapshot.deployments.get(deployment.id)
-        current_gpu_group_id = (
-            (current.selected_gpu_group_id or current.gpu_group_id)
-            if current is not None
-            else None
+        await self._prepare_dispatch(
+            deployment=deployment,
+            request_id=request_id,
+            target_gpu_group_id=target_gpu_group_id,
+            should_evict=should_evict,
+            should_sleep=should_sleep,
+            should_wake=should_wake,
+            deadline=deadline,
         )
-        should_start = (
-            current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
-        )
-        planned_evictions = list(should_evict)
-        if (
-            current is not None
-            and current.loaded
-            and current_gpu_group_id is not None
-            and current_gpu_group_id != target_gpu_group_id
-        ):
-            if current.active_request_ids:
-                raise RuntimeOperationError(
-                    "deployment is busy and cannot switch gpu group",
-                    detail={
-                        "error": "deployment is busy and cannot switch gpu group",
-                        "deployment_id": deployment.id,
-                        "current_gpu_group_id": current_gpu_group_id,
-                        "target_gpu_group_id": target_gpu_group_id,
-                        "active_request_ids": current.active_request_ids,
-                    },
-                    status_code=409,
-                )
-            planned_evictions.append(deployment.id)
-        self._update_request_observation(
-            request_id,
-            phase="loading" if should_start else "waiting",
-            wait_reason="Loading model" if should_start else "Waiting for backend dispatch",
-            deployment_id=deployment.id,
-            backend_runtime_id=deployment.backend_runtime_id,
-            gpu_group_id=target_gpu_group_id,
-        )
-        if should_start:
-            planned_evictions = list(dict.fromkeys(planned_evictions))
-            self._prepare_group_for_load(planned_evictions, reason=f"routing to {deployment.id}")
-            await self._start_and_mark_ready(
-                deployment,
-                selected_gpu_group_id=target_gpu_group_id,
-                reason=f"routing request {request_id}",
-            )
         self.state_store.mutate(
             lambda state: self._mark_request_running(
                 state,
@@ -1692,7 +1676,133 @@ class ShardonRuntime:
                     status_code=409,
                 ) from exc
 
-    def _prepare_group_for_load(self, deployment_ids: list[str], *, reason: str) -> None:
+    async def _prepare_dispatch(
+        self,
+        *,
+        deployment: DeploymentConfig,
+        request_id: str,
+        target_gpu_group_id: str,
+        should_evict: list[str],
+        should_sleep: list[str] | None,
+        should_wake: bool,
+        deadline: float | None,
+    ) -> None:
+        """Make the deployment awake and ready in the target group.
+
+        Starts it (cold load) when needed, or wakes it when it is asleep. Wake
+        time counts against the caller's ``deadline`` (interactive timeout).
+        """
+        snapshot = self.state_store.mutate(self._reconcile_loaded_processes)
+        current = snapshot.deployments.get(deployment.id)
+        current_gpu_group_id = (
+            (current.selected_gpu_group_id or current.gpu_group_id)
+            if current is not None
+            else None
+        )
+        should_start = (
+            current is None or not current.loaded or current_gpu_group_id != target_gpu_group_id
+        )
+        planned_evictions = list(should_evict)
+        if (
+            current is not None
+            and current.loaded
+            and current_gpu_group_id is not None
+            and current_gpu_group_id != target_gpu_group_id
+        ):
+            if current.active_request_ids:
+                raise RuntimeOperationError(
+                    "deployment is busy and cannot switch gpu group",
+                    detail={
+                        "error": "deployment is busy and cannot switch gpu group",
+                        "deployment_id": deployment.id,
+                        "current_gpu_group_id": current_gpu_group_id,
+                        "target_gpu_group_id": target_gpu_group_id,
+                        "active_request_ids": current.active_request_ids,
+                    },
+                    status_code=409,
+                )
+            planned_evictions.append(deployment.id)
+        needs_wake = (
+            not should_start and current is not None and current.state in SLEEP_STATES
+        )
+        if needs_wake and not should_wake:
+            # It fell asleep after scheduling; waking needs memory planning.
+            raise _RescheduleRequest(f"{deployment.id} fell asleep after scheduling")
+        if should_start:
+            wait_reason = "Loading model"
+        elif needs_wake:
+            wait_reason = "Waking model"
+        else:
+            wait_reason = "Waiting for backend dispatch"
+        self._update_request_observation(
+            request_id,
+            phase="loading" if should_start or needs_wake else "waiting",
+            wait_reason=wait_reason,
+            deployment_id=deployment.id,
+            backend_runtime_id=deployment.backend_runtime_id,
+            gpu_group_id=target_gpu_group_id,
+        )
+        if should_start:
+            planned_evictions = list(dict.fromkeys(planned_evictions))
+            await self._prepare_group_for_load(
+                planned_evictions,
+                sleep_ids=should_sleep,
+                reason=f"routing to {deployment.id}",
+            )
+            await self._start_and_mark_ready(
+                deployment,
+                selected_gpu_group_id=target_gpu_group_id,
+                reason=f"routing request {request_id}",
+            )
+        elif needs_wake:
+            await self._prepare_group_for_load(
+                planned_evictions,
+                sleep_ids=should_sleep,
+                reason=f"waking {deployment.id}",
+            )
+            await self._ensure_awake(
+                deployment,
+                gpu_group_id=target_gpu_group_id,
+                request_id=request_id,
+                deadline=deadline,
+            )
+
+    async def _prepare_group_for_load(
+        self,
+        deployment_ids: list[str],
+        *,
+        reason: str,
+        sleep_ids: list[str] | None = None,
+    ) -> None:
+        stop_ids = list(deployment_ids)
+        slept_any = False
+        for deployment_id in sleep_ids or []:
+            if deployment_id in stop_ids:
+                continue
+            try:
+                await self.sleep_deployment(
+                    deployment_id,
+                    actor="scheduler",
+                    reason=f"sleep_on_evict: {reason}",
+                    source="evict",
+                    require_idle=False,
+                    enforce_limits=False,
+                )
+                slept_any = True
+            except RuntimeOperationError as exc:
+                self.event_logger.emit(
+                    "deployment.evict",
+                    "sleep-on-evict failed; stopping deployment instead",
+                    deployment_id=deployment_id,
+                    reason=reason,
+                    error=str(exc),
+                )
+                stop_ids.append(deployment_id)
+        self._stop_for_load(stop_ids, reason=reason)
+        if slept_any:
+            await self.enforce_sleep_limits()
+
+    def _stop_for_load(self, deployment_ids: list[str], *, reason: str) -> None:
         snapshot = self.snapshot()
         for deployment_id in deployment_ids:
             state = snapshot.deployments.get(deployment_id)
@@ -1790,6 +1900,8 @@ class ShardonRuntime:
                 )
                 return
             if not current.loaded and current.process_id is None:
+                return
+            if current.state in {"falling_asleep", "waking", "stopping"}:
                 return
             old_pid = current.process_id or observed_pid
             try:
@@ -1953,6 +2065,714 @@ class ShardonRuntime:
                 source="request",
                 request_id=request_id,
             )
+
+    # ------------------------------------------------------------------
+    # Sleep / wake lifecycle (vLLM sleep mode)
+    #
+    # Cross-process coordination: the admin API and the router are separate
+    # processes sharing the state file. Transitions are claimed with
+    # compare-and-set mutations (ready -> falling_asleep, sleeping -> waking,
+    # sleeping -> stopping) so only one actor drives a transition. Within one
+    # process the per-deployment asyncio lock serialises lifecycle work, and a
+    # single shared wake task serves every concurrent waiter.
+    # ------------------------------------------------------------------
+
+    def sleep_policy(self, deployment_id: str) -> SleepPolicy:
+        return self.config.sleep_policy_for(deployment_id)
+
+    def _deployment_adapter(self, deployment: DeploymentConfig, gpu_group_id: str) -> Any:
+        return self.backends.adapter_for(deployment.backend_runtime_id, gpu_group_id=gpu_group_id)
+
+    def _sleep_refusal(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment: DeploymentConfig,
+        *,
+        require_idle: bool,
+    ) -> str | None:
+        runtime = snapshot.deployments.get(deployment.id)
+        if runtime is None or not runtime.loaded:
+            return "deployment is not loaded"
+        if runtime.state == "sleeping":
+            return "already sleeping"
+        if runtime.state != "ready":
+            return f"deployment is {runtime.state}"
+        if runtime.active_request_ids:
+            return "deployment is serving requests"
+        if not require_idle:
+            return None
+        for request in snapshot.queued_requests:
+            if request.status != "queued":
+                continue
+            if request.deployment_id == deployment.id or (
+                not request.deployment_id and request.model_name == deployment.api_model_name
+            ):
+                return "requests are queued for this deployment"
+        for job in snapshot.batch_jobs.values():
+            if job.status not in {"queued", "running"}:
+                continue
+            if job.deployment_id == deployment.id or (
+                job.deployment_id is None and job.model_name == deployment.api_model_name
+            ):
+                return "batch work targets this deployment"
+        return None
+
+    async def sleep_deployment(
+        self,
+        deployment_id: str,
+        *,
+        actor: str = "operator",
+        reason: str | None = None,
+        source: Literal["manual", "public", "idle", "evict"] = "manual",
+        require_idle: bool = True,
+        enforce_limits: bool = True,
+    ) -> dict[str, Any]:
+        deployment = self.resolve_deployment(deployment_id=deployment_id)
+        policy = self.sleep_policy(deployment.id)
+        if not policy.enabled:
+            raise RuntimeOperationError(
+                "sleep mode is not enabled for this deployment",
+                detail={
+                    "error": "sleep mode is not enabled for this deployment",
+                    "deployment_id": deployment.id,
+                },
+                status_code=409,
+            )
+        reason = reason or f"{source} sleep requested by {actor}"
+        async with self._deployment_lock(deployment.id):
+            claim: dict[str, Any] = {}
+
+            def claim_sleep(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+                snapshot = self._seed_snapshot(snapshot)
+                refusal = self._sleep_refusal(snapshot, deployment, require_idle=require_idle)
+                if refusal is not None:
+                    claim["refusal"] = refusal
+                    return snapshot
+                runtime = snapshot.deployments[deployment.id]
+                runtime.state = "falling_asleep"
+                runtime.sleep_transition_started_at = utc_now_iso()
+                runtime.last_transition_reason = reason
+                claim["gpu_group_id"] = runtime.selected_gpu_group_id or runtime.gpu_group_id
+                return snapshot
+
+            self.state_store.mutate(claim_sleep)
+            if claim.get("refusal") == "already sleeping":
+                return {
+                    "status": "ok",
+                    "detail": "deployment already sleeping",
+                    "deployment_id": deployment.id,
+                }
+            if "refusal" in claim:
+                raise RuntimeOperationError(
+                    f"deployment cannot sleep: {claim['refusal']}",
+                    detail={
+                        "error": "deployment cannot sleep",
+                        "reason": claim["refusal"],
+                        "deployment_id": deployment.id,
+                    },
+                    status_code=409,
+                )
+            gpu_group_id = claim["gpu_group_id"]
+            adapter = self._deployment_adapter(deployment, gpu_group_id)
+            self.event_logger.emit(
+                "deployment.sleep_started",
+                "putting deployment to sleep",
+                deployment_id=deployment.id,
+                gpu_group_id=gpu_group_id,
+                level=policy.level,
+                mode=policy.mode,
+                source=source,
+                actor=actor,
+                reason=reason,
+            )
+            started = time.monotonic()
+            try:
+                await adapter.sleep(
+                    level=policy.level,
+                    mode=policy.mode,
+                    timeout=policy.sleep_timeout_seconds,
+                )
+                if not await adapter.is_sleeping():
+                    raise BackendOperationError(
+                        "backend still reports awake after /sleep",
+                        detail={"error": "backend still reports awake after /sleep"},
+                    )
+            except asyncio.CancelledError:
+                self.state_store.mutate(
+                    lambda state: self._revert_sleep_claim(state, deployment.id, "sleep cancelled")
+                )
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                try:
+                    asleep = await adapter.is_sleeping()
+                except Exception:
+                    asleep = False
+                if not asleep:
+                    self.state_store.mutate(
+                        lambda state: self._revert_sleep_claim(
+                            state, deployment.id, f"sleep failed: {error}"
+                        )
+                    )
+                    self.event_logger.emit(
+                        "deployment.sleep_failed",
+                        "deployment failed to sleep; it stays awake",
+                        deployment_id=deployment.id,
+                        gpu_group_id=gpu_group_id,
+                        source=source,
+                        error=error,
+                        duration_seconds=round(time.monotonic() - started, 3),
+                    )
+                    raise RuntimeOperationError(
+                        "deployment failed to sleep",
+                        detail={
+                            "error": "deployment failed to sleep",
+                            "deployment_id": deployment.id,
+                            "detail": error,
+                        },
+                        status_code=409,
+                    ) from exc
+            duration = round(time.monotonic() - started, 3)
+            self.state_store.mutate(
+                lambda state: self._mark_sleeping(
+                    state,
+                    deployment.id,
+                    level=policy.level,
+                    residual_fraction=policy.sleeping_memory_fraction,
+                    reason=reason,
+                    detail={
+                        "level": policy.level,
+                        "mode": policy.mode,
+                        "source": source,
+                        "actor": actor,
+                        "duration_seconds": duration,
+                    },
+                )
+            )
+            self.event_logger.emit(
+                "deployment.sleep",
+                "deployment is asleep",
+                deployment_id=deployment.id,
+                gpu_group_id=gpu_group_id,
+                level=policy.level,
+                source=source,
+                actor=actor,
+                duration_seconds=duration,
+            )
+        if source in {"manual", "public"}:
+            self.event_logger.audit("runtime.sleep", actor, deployment_id=deployment.id)
+        if enforce_limits:
+            await self.enforce_sleep_limits()
+        return {
+            "status": "ok",
+            "deployment_id": deployment.id,
+            "gpu_group_id": gpu_group_id,
+            "level": policy.level,
+            "duration_seconds": duration,
+        }
+
+    async def wake_deployment(
+        self, deployment_id: str, *, actor: str = "operator"
+    ) -> dict[str, Any]:
+        deployment = self.resolve_deployment(deployment_id=deployment_id)
+        snapshot = self.refresh_gpu_observations()
+        runtime_state = snapshot.deployments.get(deployment.id)
+        if runtime_state is None or not runtime_state.loaded:
+            raise RuntimeOperationError(
+                "deployment is not loaded",
+                detail={"error": "deployment is not loaded", "deployment_id": deployment.id},
+                status_code=409,
+            )
+        gpu_group_id = runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id
+        if runtime_state.state not in SLEEP_STATES:
+            return {
+                "status": "ok",
+                "detail": "deployment already awake",
+                "deployment_id": deployment.id,
+                "gpu_group_id": gpu_group_id,
+            }
+        decision = self.scheduler.schedule(
+            SchedulingRequest(
+                model_name=deployment.api_model_name,
+                task=deployment.tasks[0] if deployment.tasks else "chat",
+                priority=10_000,
+                request_class="manual",
+                request_id=f"manual_wake_{deployment.id}",
+                deployment_id=deployment.id,
+                target_gpu_group_id=gpu_group_id,
+            ),
+            snapshot,
+            utc_now(),
+        )
+        if not decision.accepted or not decision.should_wake:
+            raise RuntimeOperationError(
+                "deployment cannot wake now",
+                detail={
+                    "error": "deployment cannot wake now",
+                    "deployment_id": deployment.id,
+                    "reason": decision.reason,
+                },
+                status_code=409,
+            )
+        await self._prepare_group_for_load(
+            decision.should_evict or [],
+            sleep_ids=decision.should_sleep or [],
+            reason=f"manual wake requested by {actor}",
+        )
+        await self._ensure_awake(
+            deployment,
+            gpu_group_id=gpu_group_id,
+            reason=f"manual wake requested by {actor}",
+        )
+        self.event_logger.audit("runtime.wake", actor, deployment_id=deployment.id)
+        return {"status": "ok", "deployment_id": deployment.id, "gpu_group_id": gpu_group_id}
+
+    async def _ensure_awake(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        gpu_group_id: str,
+        request_id: str | None = None,
+        deadline: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Wait until the deployment is awake, waking it if needed.
+
+        Concurrent callers share one wake task. Each waiter is bounded by its
+        own ``deadline`` (event-loop time); the wake itself keeps going.
+        """
+        state = self.snapshot().deployments.get(deployment.id)
+        if state is None or not state.loaded or state.state not in SLEEP_STATES:
+            return
+        task = self._wake_tasks.get(deployment.id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._wake_or_restart(
+                    deployment,
+                    gpu_group_id=gpu_group_id,
+                    trigger=request_id or reason or "wake requested",
+                )
+            )
+            # Retrieve the outcome even when every waiter timed out.
+            task.add_done_callback(lambda done: done.cancelled() or done.exception())
+            self._wake_tasks[deployment.id] = task
+        timeout = None
+        if deadline is not None:
+            timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except TimeoutError as exc:
+            raise RuntimeOperationError(
+                "request timed out waiting for the deployment to wake",
+                detail={
+                    "error": "request timed out waiting for the deployment to wake",
+                    "deployment_id": deployment.id,
+                    "request_id": request_id,
+                },
+                status_code=409,
+            ) from exc
+
+    async def _await_settled_sleep_state(
+        self,
+        deployment: DeploymentConfig,
+        policy: SleepPolicy,
+        adapter: Any,
+    ) -> DeploymentRuntimeState | None:
+        """Wait out a sleep/wake transition driven by another process."""
+        stale_after = policy.sleep_timeout_seconds + policy.wake_timeout_seconds + 30
+        while True:
+            state = self.snapshot().deployments.get(deployment.id)
+            if state is None or state.state not in {"falling_asleep", "waking"}:
+                return state
+            started = state.sleep_transition_started_at
+            age = (
+                (utc_now() - datetime.fromisoformat(started)).total_seconds()
+                if started
+                else stale_after + 1
+            )
+            if age <= stale_after:
+                await asyncio.sleep(self.config.global_config.queue_poll_interval_seconds)
+                continue
+            # The process driving the transition is gone. Ask the backend.
+            try:
+                asleep = await adapter.is_sleeping()
+            except Exception:
+                asleep = True  # unknown: let the wake attempt (or restart) decide
+            stale_state = state.state
+
+            def settle(
+                snapshot: RuntimeStateSnapshot,
+                asleep: bool = asleep,
+                stale_state: str = stale_state,
+            ) -> RuntimeStateSnapshot:
+                runtime = snapshot.deployments.get(deployment.id)
+                if runtime is not None and runtime.state == stale_state:
+                    if asleep:
+                        runtime.state = "sleeping"
+                        runtime.slept_at = runtime.slept_at or utc_now_iso()
+                    else:
+                        self._apply_awake(runtime, deployment)
+                    runtime.sleep_transition_started_at = None
+                    runtime.last_transition_reason = f"recovered stale {stale_state} transition"
+                return snapshot
+
+            self.state_store.mutate(settle)
+
+    async def _wake_or_restart(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        gpu_group_id: str,
+        trigger: str,
+    ) -> None:
+        policy = self.sleep_policy(deployment.id)
+        adapter = self._deployment_adapter(deployment, gpu_group_id)
+        async with self._deployment_lock(deployment.id):
+            while True:
+                state = await self._await_settled_sleep_state(deployment, policy, adapter)
+                if state is None or not state.loaded or state.state == "stopping":
+                    raise _RescheduleRequest(f"{deployment.id} was unloaded while waking")
+                if state.state not in SLEEP_STATES:
+                    return
+                claimed = False
+
+                def claim_wake(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+                    nonlocal claimed
+                    runtime = snapshot.deployments.get(deployment.id)
+                    if runtime is not None and runtime.loaded and runtime.state == "sleeping":
+                        runtime.state = "waking"
+                        runtime.sleep_transition_started_at = utc_now_iso()
+                        runtime.last_transition_reason = f"waking for {trigger}"
+                        claimed = True
+                    return snapshot
+
+                self.state_store.mutate(claim_wake)
+                if claimed:
+                    break
+            level = state.sleep_level or policy.level
+            self.event_logger.emit(
+                "deployment.wake_started",
+                "waking deployment",
+                deployment_id=deployment.id,
+                gpu_group_id=gpu_group_id,
+                level=level,
+                trigger=trigger,
+            )
+            started = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    self._run_wake_sequence(adapter, level=level, policy=policy),
+                    timeout=policy.wake_timeout_seconds,
+                )
+                if await adapter.is_sleeping():
+                    raise BackendOperationError(
+                        "backend still reports sleeping after wake",
+                        detail={"error": "backend still reports sleeping after wake"},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = (
+                    f"wake timed out after {policy.wake_timeout_seconds}s"
+                    if isinstance(exc, TimeoutError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                self.event_logger.emit(
+                    "deployment.wake_failed",
+                    "wake failed; falling back to a cold restart",
+                    deployment_id=deployment.id,
+                    gpu_group_id=gpu_group_id,
+                    level=level,
+                    trigger=trigger,
+                    error=error,
+                    duration_seconds=round(time.monotonic() - started, 3),
+                )
+                await self._restart_after_failed_wake(
+                    deployment,
+                    gpu_group_id=gpu_group_id,
+                    error=error,
+                )
+                return
+            duration = round(time.monotonic() - started, 3)
+            self.state_store.mutate(
+                lambda snapshot: self._mark_awake(
+                    snapshot, deployment, reason=f"woken for {trigger}", duration=duration
+                )
+            )
+            self.event_logger.emit(
+                "deployment.wake",
+                "deployment is awake",
+                deployment_id=deployment.id,
+                gpu_group_id=gpu_group_id,
+                level=level,
+                trigger=trigger,
+                duration_seconds=duration,
+            )
+
+    async def _run_wake_sequence(self, adapter: Any, *, level: int, policy: SleepPolicy) -> None:
+        timeout = policy.wake_timeout_seconds
+        if level == 2:
+            # Level 2 discarded the weights: re-allocate, reload, then KV cache.
+            await adapter.wake_up(tags=["weights"], timeout=timeout)
+            await adapter.collective_rpc("reload_weights", timeout=timeout)
+            await adapter.wake_up(tags=["kv_cache"], timeout=timeout)
+        else:
+            await adapter.wake_up(timeout=timeout)
+
+    async def _restart_after_failed_wake(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        gpu_group_id: str,
+        error: str,
+    ) -> None:
+        """Cold load fallback. Caller holds the deployment lock."""
+        current = self.snapshot().deployments.get(deployment.id)
+        if current is not None and (current.loaded or current.process_id is not None):
+            await self._stop_unhealthy_backend(deployment, current, gpu_group_id=gpu_group_id)
+        self.state_store.mutate(
+            lambda state: self._mark_unavailable(
+                state,
+                deployment.id,
+                reason=f"wake failed: {error}",
+                error=error,
+                preserve_active_requests=True,
+            )
+        )
+        await self._start_and_mark_ready_locked(
+            deployment,
+            selected_gpu_group_id=gpu_group_id,
+            reason="cold restart after failed wake",
+        )
+        self.event_logger.emit(
+            "deployment.wake_fallback_restart",
+            "deployment restarted after a failed wake",
+            deployment_id=deployment.id,
+            gpu_group_id=gpu_group_id,
+            error=error,
+        )
+
+    async def sleep_idle_deployments(self) -> list[str]:
+        """Put deployments to sleep after ``idle_seconds`` without activity.
+
+        Health/readiness probes and ``/v1/models`` never count as activity:
+        only request dispatch/completion, readiness and wake timestamps do.
+        """
+        snapshot = self.snapshot()
+        now = utc_now()
+        candidates: list[str] = []
+        for deployment in self.config.deployments.values():
+            policy = self.sleep_policy(deployment.id)
+            if not policy.enabled:
+                continue
+            if self._sleep_refusal(snapshot, deployment, require_idle=True) is not None:
+                continue
+            last_activity = snapshot.deployments[deployment.id].last_activity_at()
+            if last_activity is None:
+                continue
+            if (now - last_activity).total_seconds() < policy.idle_seconds:
+                continue
+            candidates.append(deployment.id)
+        slept: list[str] = []
+        for deployment_id in candidates:
+            policy = self.sleep_policy(deployment_id)
+            try:
+                await self.sleep_deployment(
+                    deployment_id,
+                    actor="scheduler",
+                    reason=f"idle for at least {policy.idle_seconds}s",
+                    source="idle",
+                )
+                slept.append(deployment_id)
+            except RuntimeOperationError:
+                # Raced with new work, or the backend refused; failures are
+                # already recorded as deployment.sleep_failed events.
+                continue
+        if not candidates:
+            await self.enforce_sleep_limits()
+        return slept
+
+    async def enforce_sleep_limits(self) -> list[str]:
+        """Stop sleepers beyond ``max_sleep_seconds`` or the sleeping caps.
+
+        Caps: ``gpu_groups.<id>.max_sleeping`` and the host-wide
+        ``max_sleeping_deployments``. The least recently used sleepers are
+        stopped first.
+        """
+        snapshot = self.snapshot()
+        now = utc_now()
+        sleeping = {
+            deployment_id: runtime
+            for deployment_id, runtime in snapshot.deployments.items()
+            if runtime.loaded and runtime.state == "sleeping"
+        }
+        stoppable = {
+            deployment_id: runtime
+            for deployment_id, runtime in sleeping.items()
+            if not runtime.active_request_ids
+            and deployment_id in self.config.deployments
+            and self._sleep_refusal(
+                snapshot, self.config.deployments[deployment_id], require_idle=True
+            )
+            == "already sleeping"
+        }
+        victims: dict[str, str] = {}
+        for deployment_id, runtime in stoppable.items():
+            limit = self.sleep_policy(deployment_id).max_sleep_seconds
+            if limit is None or not runtime.slept_at:
+                continue
+            asleep_for = (now - datetime.fromisoformat(runtime.slept_at)).total_seconds()
+            if asleep_for >= limit:
+                victims[deployment_id] = (
+                    f"asleep for {int(asleep_for)}s (max_sleep_seconds={limit})"
+                )
+
+        def lru(ids: list[str]) -> list[str]:
+            return sorted(
+                ids,
+                key=lambda item: (
+                    stoppable[item].last_activity_at() or datetime.min.replace(tzinfo=UTC)
+                ),
+            )
+
+        def apply_cap(scope: list[str], cap: int | None, label: str) -> None:
+            if cap is None:
+                return
+            remaining = [item for item in scope if item not in victims]
+            excess = len(remaining) - cap
+            for deployment_id in lru([item for item in remaining if item in stoppable]):
+                if excess <= 0:
+                    break
+                victims[deployment_id] = f"{label} exceeded (limit {cap})"
+                excess -= 1
+
+        for group in self.config.gpu_groups.values():
+            apply_cap(
+                [item for item, runtime in sleeping.items() if runtime.gpu_group_id == group.id],
+                group.max_sleeping,
+                f"max_sleeping for {group.id}",
+            )
+        apply_cap(
+            list(sleeping),
+            self.config.global_config.max_sleeping_deployments,
+            "max_sleeping_deployments",
+        )
+        stopped: list[str] = []
+        for deployment_id, why in victims.items():
+            if await self._stop_sleeping_deployment(deployment_id, reason=why):
+                stopped.append(deployment_id)
+        return stopped
+
+    async def _stop_sleeping_deployment(self, deployment_id: str, *, reason: str) -> bool:
+        async with self._deployment_lock(deployment_id):
+            claimed: DeploymentRuntimeState | None = None
+
+            def claim_stop(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
+                nonlocal claimed
+                runtime = snapshot.deployments.get(deployment_id)
+                if (
+                    runtime is not None
+                    and runtime.loaded
+                    and runtime.state == "sleeping"
+                    and not runtime.active_request_ids
+                ):
+                    runtime.state = "stopping"
+                    runtime.last_transition_reason = reason
+                    claimed = runtime.model_copy()
+                return snapshot
+
+            self.state_store.mutate(claim_stop)
+            if claimed is None:
+                return False
+            gpu_group_id = claimed.selected_gpu_group_id or claimed.gpu_group_id
+            self._ensure_supervised_process(deployment_id, claimed)
+            await asyncio.to_thread(
+                self.backends.stop,
+                deployment_id,
+                gpu_group_id=gpu_group_id,
+                force=False,
+            )
+            self.state_store.mutate(
+                lambda state: self._mark_unloaded(state, deployment_id, reason=reason)
+            )
+            self.event_logger.emit(
+                "deployment.sleep_stop",
+                "stopped a sleeping deployment",
+                deployment_id=deployment_id,
+                gpu_group_id=gpu_group_id,
+                reason=reason,
+            )
+            return True
+
+    def _revert_sleep_claim(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment_id: str,
+        reason: str,
+    ) -> RuntimeStateSnapshot:
+        runtime = snapshot.deployments.get(deployment_id)
+        if runtime is not None and runtime.state == "falling_asleep":
+            runtime.state = "ready"
+            runtime.sleep_transition_started_at = None
+            runtime.last_transition_reason = reason
+        return snapshot
+
+    def _mark_sleeping(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment_id: str,
+        *,
+        level: int,
+        residual_fraction: float,
+        reason: str,
+        detail: dict[str, Any],
+    ) -> RuntimeStateSnapshot:
+        runtime = snapshot.deployments[deployment_id]
+        runtime.state = "sleeping"
+        runtime.sleep_level = level
+        runtime.slept_at = utc_now_iso()
+        runtime.sleep_transition_started_at = None
+        if runtime.awake_memory_fraction is None:
+            runtime.awake_memory_fraction = runtime.resident_memory_fraction
+        runtime.resident_memory_fraction = min(runtime.resident_memory_fraction, residual_fraction)
+        runtime.last_transition_reason = reason
+        runtime.last_sleep_detail = detail
+        return snapshot
+
+    def _apply_awake(self, runtime: DeploymentRuntimeState, deployment: DeploymentConfig) -> None:
+        group_id = runtime.selected_gpu_group_id or runtime.gpu_group_id
+        runtime.state = "ready"
+        runtime.resident_memory_fraction = (
+            runtime.awake_memory_fraction
+            if runtime.awake_memory_fraction is not None
+            else deployment.memory_fraction_for_group(group_id)
+        )
+        runtime.awake_memory_fraction = None
+        runtime.sleep_level = None
+        runtime.slept_at = None
+        runtime.sleep_transition_started_at = None
+        runtime.woke_at = utc_now_iso()
+
+    def _mark_awake(
+        self,
+        snapshot: RuntimeStateSnapshot,
+        deployment: DeploymentConfig,
+        *,
+        reason: str,
+        duration: float,
+    ) -> RuntimeStateSnapshot:
+        runtime = snapshot.deployments[deployment.id]
+        self._apply_awake(runtime, deployment)
+        runtime.last_transition_reason = reason
+        runtime.last_sleep_detail = {**runtime.last_sleep_detail, "wake_duration_seconds": duration}
+        return snapshot
+
+    @staticmethod
+    def _clear_sleep_fields(runtime: DeploymentRuntimeState) -> None:
+        runtime.sleep_level = None
+        runtime.sleep_transition_started_at = None
+        runtime.slept_at = None
+        runtime.awake_memory_fraction = None
 
     def _reconcile_loaded_processes(self, snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
         snapshot = self._seed_snapshot(snapshot)
@@ -2200,6 +3020,7 @@ class ShardonRuntime:
         runtime.last_error = None
         runtime.last_transition_reason = reason
         runtime.last_readiness_detail = readiness_detail
+        self._clear_sleep_fields(runtime)
         return snapshot
 
     def _mark_starting(
@@ -2243,6 +3064,7 @@ class ShardonRuntime:
         runtime.last_error = detail.get("error")
         runtime.last_transition_reason = reason
         runtime.last_readiness_detail = detail
+        self._clear_sleep_fields(runtime)
         return snapshot
 
     def _mark_unavailable(
@@ -2265,6 +3087,7 @@ class ShardonRuntime:
             runtime.active_request_ids = []
         runtime.last_error = error
         runtime.last_transition_reason = reason
+        self._clear_sleep_fields(runtime)
         return snapshot
 
     def _mark_unloaded(
@@ -2283,6 +3106,7 @@ class ShardonRuntime:
         runtime.resident_memory_fraction = 0.0
         runtime.active_request_ids = []
         runtime.last_transition_reason = reason
+        self._clear_sleep_fields(runtime)
         return snapshot
 
     def _mark_request_running(
@@ -2301,6 +3125,11 @@ class ShardonRuntime:
                 detail={"error": "request cancelled", "request_id": request_id},
                 status_code=409,
             )
+        runtime = snapshot.deployments[deployment.id]
+        if runtime.state in SLEEP_STATES or runtime.state == "stopping":
+            # Never forward to a sleeping (or sleep-transitioning) process.
+            # Raising aborts this state mutation; the request stays queued.
+            raise _RescheduleRequest(f"{deployment.id} is {runtime.state}")
         queued.deployment_id = deployment.id
         queued.backend_runtime_id = deployment.backend_runtime_id
         queued.gpu_group_id = selected_gpu_group_id
@@ -2468,16 +3297,25 @@ class ShardonRuntime:
         job = state.batch_jobs[job.id]
         if not claimed:
             return
-        if decision.should_load:
-            self._prepare_group_for_load(
+        if decision.should_load or decision.should_wake:
+            await self._prepare_group_for_load(
                 decision.should_evict or [],
+                sleep_ids=decision.should_sleep or [],
                 reason=f"batch scheduling for {job.id}",
             )
+        if decision.should_load:
             await self._start_and_mark_ready(
                 deployment,
                 selected_gpu_group_id=selected_gpu_group_id,
                 reason=f"batch scheduling for {job.id}",
             )
+        # Batch work never runs against a sleeping process. Running batches
+        # also block idle and manual sleep until they finish.
+        await self._ensure_awake(
+            deployment,
+            gpu_group_id=selected_gpu_group_id,
+            reason=f"batch {job.id}",
+        )
         adapter = self.backends.adapter_for(
             deployment.backend_runtime_id,
             gpu_group_id=selected_gpu_group_id,
@@ -2820,4 +3658,8 @@ class ShardonRuntime:
             "gpu_groups": self._group_runtime_status(snapshot),
             "backend_health": snapshot.backend_health,
             "deployment_capabilities": self._deployment_capability_status(),
+            "sleep_policies": {
+                deployment_id: self.sleep_policy(deployment_id).model_dump(mode="json")
+                for deployment_id in self.config.deployments
+            },
         }

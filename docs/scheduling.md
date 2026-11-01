@@ -11,11 +11,13 @@ Shardon schedules both interactive and batch work against deployments rather tha
 - If lower-priority work is still queued for the currently loaded model, Shardon preserves that model for up to five minutes before switching.
 - When a target GPU group is occupied by another managed deployment, Shardon evaluates whether it can evict and swap that deployment cleanly.
 - Backend startup is gated by readiness checks before the request is forwarded.
+- Opt-in vLLM sleep mode: a sleeping deployment stays loaded (same process and port) and is woken before any request is forwarded. Waking re-runs admission like a load. Sleeping deployments are evicted before awake ones, and `sleep_on_evict` deployments are put to sleep instead of stopped when the incoming deployment uses another port. See [Sleep mode and elastic memory](sleep-and-elastic-memory.md).
 - When no admissible deployment exists, the router returns HTTP `409` with candidate and GPU-group diagnostics instead of only a generic timeout.
 
 ## Batch Jobs
 
 - Batch jobs use an OpenAI-compatible submission surface.
 - Batch execution is handled by Shardon itself.
-- Batch work never forces a model switch on a busy group.
+- Batch work never forces a model switch on a busy group, and never displaces an awake deployment.
+- Batch work wakes a sleeping deployment before its first item. Queued or running batch work keeps its deployment from idle or manual sleep.
 - Extra Shardon endpoints expose progress beyond the standard batch API.

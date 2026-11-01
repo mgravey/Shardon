@@ -141,7 +141,7 @@ def test_prepare_group_for_load_can_stop_adopted_process(tmp_path: Path) -> None
                 }
             )
         )
-        runtime._prepare_group_for_load(["chat-a"], reason="test switch")
+        asyncio.run(runtime._prepare_group_for_load(["chat-a"], reason="test switch"))
         deadline = time.time() + 5
         while process.poll() is None and time.time() < deadline:
             time.sleep(0.05)

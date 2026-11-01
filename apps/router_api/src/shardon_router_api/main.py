@@ -90,6 +90,8 @@ async def _run_background_tick(runtime: ShardonRuntime) -> None:
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
         await runtime.process_one_batch()
+        # Idle sleep (opt-in per backend/deployment) and sleeping caps.
+        await runtime.sleep_idle_deployments()
     except asyncio.CancelledError:
         raise
     except Exception as exc:

@@ -368,6 +368,8 @@ class ActivityDeployment(BaseModel):
     id: str
     state: str
     gpu_group_id: str | None
+    sleep_enabled: bool = False
+    slept_at: str | None = None
 
 
 class ModelActivity(BaseModel):
@@ -444,6 +446,8 @@ def activity_snapshot(
                     if state
                     else None
                 ),
+                sleep_enabled=config.sleep_policy_for(deployment.id).enabled,
+                slept_at=state.slept_at if state else None,
             )
         )
     unique = {r.id: r for r in snapshot.queued_requests if r.status == "queued"}

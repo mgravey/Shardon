@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-11-01
+
+- Add opt-in vLLM sleep/wake orchestration (`sleep` on backends, overridable per deployment): idle sleep after `idle_seconds` (default 10 minutes), wake on demand shared by concurrent requests, level 1 and level 2 wake sequences confirmed by `/is_sleeping`, wake time counted against the interactive timeout, and a cold-restart fallback when a wake fails.
+- Add `falling_asleep`, `sleeping` and `waking` deployment states to status APIs, events, the activity view and the admin UI. Sleeping deployments stay loaded, with resident memory reduced to the sleeping residual.
+- Plan wakes like loads, and evict sleeping deployments before awake ones. `sleep_on_evict` sleeps instead of stopping when the incoming deployment uses another port.
+- Bound sleepers with `gpu_groups.<id>.max_sleeping`, `max_sleeping_deployments` and `sleep.max_sleep_seconds`; the least recently used sleepers are stopped completely.
+- Add admin sleep/wake endpoints, per-deployment Sleep/Wake/Stop/Load buttons, and a public no-admin Sleep button on the activity board (idle, sleep-enabled deployments only). The router never proxies vLLM dev endpoints.
+- Add the vLLM sleep API to the `mock-vllm-v2` demo runtime (`--enable-sleep-mode`), with fault injection, plus process-level tests.
+
 ## 2026-10-14
 
 - Track router instance ownership with process-held locks and recover interrupted requests on router startup and scheduler ticks, preserving live and unverifiable owners.

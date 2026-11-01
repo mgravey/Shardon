@@ -23,6 +23,10 @@ class GlobalConfig(BaseModel):
     backend_startup_timeout_seconds: int | None = None
     backend_readiness_poll_interval_seconds: float = 1.0
     backend_stop_timeout_seconds: int = 30
+    # Host-wide cap on simultaneously sleeping deployments (all GPU groups).
+    # Level-1 sleep parks weights in host RAM, so this bounds RAM pressure.
+    # None keeps sleeping unlimited; sleep itself is opt-in per backend.
+    max_sleeping_deployments: int | None = Field(default=None, ge=0)
 
     def effective_interactive_request_timeout_seconds(self) -> int:
         if self.interactive_request_timeout_seconds is not None:
@@ -68,6 +72,49 @@ class BackendCapabilities(BaseModel):
         return self
 
 
+class SleepConfig(BaseModel):
+    """vLLM sleep-mode settings. Every field is optional so that a deployment
+    can override individual backend values; see ``SleepPolicy`` for defaults."""
+
+    enabled: bool | None = None
+    level: Literal[1, 2] | None = None
+    idle_seconds: int | None = Field(default=None, ge=0)
+    mode: Literal["wait", "abort"] | None = None
+    sleep_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    wake_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    sleep_on_evict: bool | None = None
+    # Stop (fully unload) a deployment that has been asleep this long.
+    max_sleep_seconds: int | None = Field(default=None, ge=0)
+    # GPU memory a sleeping process keeps (CUDA context, allocator pools).
+    sleeping_memory_fraction: float | None = Field(default=None, ge=0, le=1)
+
+    def merged_with(self, override: SleepConfig | None) -> SleepConfig:
+        if override is None:
+            return self
+        return self.model_copy(update=override.model_dump(exclude_none=True))
+
+
+class SleepPolicy(BaseModel):
+    """Effective sleep settings after merging backend and deployment config."""
+
+    enabled: bool = False
+    level: Literal[1, 2] = 1
+    idle_seconds: int = 600
+    mode: Literal["wait", "abort"] = "wait"
+    sleep_timeout_seconds: float = 120.0
+    wake_timeout_seconds: float = 120.0
+    sleep_on_evict: bool = False
+    max_sleep_seconds: int | None = None
+    sleeping_memory_fraction: float = 0.05
+
+    @classmethod
+    def resolve(cls, *configs: SleepConfig | None) -> SleepPolicy:
+        merged = SleepConfig()
+        for config in configs:
+            merged = merged.merged_with(config)
+        return cls.model_validate(merged.model_dump(exclude_none=True))
+
+
 class BackendRuntimeConfig(BaseModel):
     id: str
     backend_type: Literal["vllm", "sglang", "mock", "whisperx"]
@@ -86,6 +133,7 @@ class BackendRuntimeConfig(BaseModel):
     stop_timeout_seconds: int | None = None
     gpu_group_overrides: dict[str, "BackendRuntimeOverride"] = Field(default_factory=dict)
     capabilities: BackendCapabilities = Field(default_factory=BackendCapabilities)
+    sleep: SleepConfig | None = None
 
     def resolved_for_gpu_group(self, gpu_group_id: str | None) -> "BackendRuntimeConfig":
         if gpu_group_id is None:
@@ -217,6 +265,7 @@ class DeploymentConfig(BaseModel):
         ]
     ] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
+    sleep: SleepConfig | None = None
 
     @model_validator(mode="after")
     def normalize_gpu_groups(self) -> "DeploymentConfig":
@@ -273,6 +322,9 @@ class GPUGroupConfig(BaseModel):
     usable_memory_fraction: float = 0.95
     keep_free: bool = False
     scheduling_tags: list[str] = Field(default_factory=list)
+    # Cap on simultaneously sleeping deployments in this group. When exceeded,
+    # the least recently used sleepers are stopped. None means unlimited.
+    max_sleeping: int | None = Field(default=None, ge=0)
 
 
 class APIKeyRecord(BaseModel):
@@ -310,3 +362,10 @@ class RepositoryConfig(BaseModel):
     gpu_groups: dict[str, GPUGroupConfig]
     admin_users: dict[str, AdminUserRecord]
     policies: dict[str, Any] = Field(default_factory=dict)
+
+    def sleep_policy_for(self, deployment_id: str) -> SleepPolicy:
+        deployment = self.deployments.get(deployment_id)
+        if deployment is None:
+            return SleepPolicy()
+        backend = self.backends.get(deployment.backend_runtime_id)
+        return SleepPolicy.resolve(backend.sleep if backend else None, deployment.sleep)

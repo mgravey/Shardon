@@ -249,7 +249,7 @@ code.secret-box {
 .runtime-table-head,
 .runtime-row {
   display: grid;
-  grid-template-columns: minmax(12rem, 1.3fr) minmax(12rem, 1.2fr) minmax(9rem, 0.8fr) minmax(8rem, 0.7fr) minmax(10rem, 0.8fr);
+  grid-template-columns: minmax(12rem, 1.3fr) minmax(12rem, 1.2fr) minmax(9rem, 0.8fr) minmax(8rem, 0.7fr) minmax(10rem, 0.8fr) minmax(11rem, 0.9fr);
   gap: 0.75rem;
   align-items: center;
 }
@@ -306,6 +306,23 @@ code.secret-box {
 
 .status-starting {
   background: rgba(255, 205, 106, 0.16);
+  color: #ffd37a;
+}
+
+.status-sleeping {
+  background: rgba(132, 160, 255, 0.18);
+  color: #a9bcff;
+}
+
+.status-falling_asleep,
+.status-waking {
+  background: rgba(132, 160, 255, 0.1);
+  color: #c9d4ff;
+  font-style: italic;
+}
+
+.status-stopping {
+  background: rgba(255, 205, 106, 0.1);
   color: #ffd37a;
 }
 
@@ -391,3 +408,10 @@ code.secret-box {
 .loaded-model-placement { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem; color: var(--muted); }
 .loaded-model-placement .status-pill { margin: 0; }
 .loaded-model-loading { color: #ffd37a; }
+
+.deployment-chip { display: inline-flex; align-items: center; gap: 0.3rem; }
+.deployment-chip .status-pill { margin: 0; }
+button.chip-action, .runtime-actions button { padding: 0.2rem 0.6rem; font-size: 0.75rem; border-radius: 999px; }
+.runtime-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.runtime-actions button.danger { border-color: rgba(240, 116, 116, 0.6); color: var(--danger); }
+.control-message { color: var(--muted); font-size: 0.85rem; margin: 0.25rem 0 0.5rem; }

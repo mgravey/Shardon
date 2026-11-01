@@ -1,4 +1,4 @@
-import ActivityBoard, { LoadedModelsBanner } from "./ActivityBoard";
+import ActivityBoard, { LoadedModelsBanner, SLEEP_STATES, stateLabel } from "./ActivityBoard";
 import { FormEvent, startTransition, useEffect, useMemo, useState } from "react";
 
 type ResourceData = {
@@ -18,6 +18,7 @@ type RuntimeData = {
   gpu_observations: Record<string, unknown>;
   gpu_groups: Record<string, unknown>;
   backend_health: Record<string, unknown>;
+  sleep_policies?: Record<string, { enabled: boolean; idle_seconds: number; level: number }>;
 };
 
 type EnvironmentStatus = {
@@ -275,6 +276,20 @@ export default function App() {
     await refresh();
   }
 
+  async function deploymentAction(action: "load" | "sleep" | "wake" | "unload", deploymentId: string) {
+    if (
+      action === "unload" &&
+      !window.confirm(`Stop ${deploymentId} completely? Its process exits and the next request cold-loads it.`)
+    ) {
+      return;
+    }
+    setMessage(`${action === "unload" ? "Stopping" : action[0].toUpperCase() + action.slice(1) + "ing"} ${deploymentId}…`);
+    await api(`/runtime/${action}/${deploymentId}`, token, { method: "POST" });
+    const done = { load: "Loaded", sleep: "Put to sleep", wake: "Woke", unload: "Stopped" }[action];
+    setMessage(`${done} ${deploymentId}.`);
+    await refresh();
+  }
+
   async function unloadDeployment() {
     if (!unloadDeploymentId) return;
     await api(`/runtime/unload/${unloadDeploymentId}`, token, { method: "POST" });
@@ -440,8 +455,12 @@ export default function App() {
         loaded?: boolean;
         selected_gpu_group_id?: string;
         state?: string;
+        slept_at?: string | null;
+        resident_memory_fraction?: number;
+        awake_memory_fraction?: number | null;
       };
       const state = String(runtimeState.state ?? "unloaded");
+      const sleepPolicy = runtime?.sleep_policies?.[deploymentId];
       return {
         deploymentId,
         displayName: String(deployment.display_name ?? deploymentId),
@@ -456,6 +475,11 @@ export default function App() {
         loaded: runtimeState.loaded === true,
         state,
         lastError: String(runtimeState.last_error ?? ""),
+        sleepEnabled: sleepPolicy?.enabled === true,
+        idleSeconds: sleepPolicy?.idle_seconds ?? null,
+        sleptAt: runtimeState.slept_at ?? null,
+        residentMemory: runtimeState.resident_memory_fraction ?? 0,
+        awakeMemory: runtimeState.awake_memory_fraction ?? null,
       };
     })
     .sort((left, right) => Number(right.loaded) - Number(left.loaded) || left.deploymentId.localeCompare(right.deploymentId));
@@ -870,6 +894,7 @@ export default function App() {
               <span>Status</span>
               <span>GPU Group</span>
               <span>Backend</span>
+              <span>Actions</span>
             </div>
             {runtimeDeploymentRows.length > 0 ? (
               runtimeDeploymentRows.map((row) => (
@@ -884,12 +909,45 @@ export default function App() {
                     <span>alias: {row.apiModelName}</span>
                   </div>
                   <div>
-                    <span className={`status-pill status-${row.state}`}>{row.state}</span>
+                    <span className={`status-pill status-${row.state}`}>{stateLabel(row.state)}</span>
                     <span>desired: {row.desiredState}</span>
+                    {row.loaded ? (
+                      <span>
+                        GPU memory: {Math.round(row.residentMemory * 100)}%
+                        {row.awakeMemory !== null ? ` (awake ${Math.round(row.awakeMemory * 100)}%)` : ""}
+                      </span>
+                    ) : null}
+                    {row.sleptAt ? <span>asleep since {new Date(row.sleptAt).toLocaleTimeString()}</span> : null}
+                    {row.sleepEnabled && row.idleSeconds !== null ? (
+                      <span>auto-sleep after {Math.round(row.idleSeconds / 60)} min idle</span>
+                    ) : null}
                     {row.lastError ? <span className="error-text">{row.lastError}</span> : null}
                   </div>
                   <span>{row.gpuGroupId}</span>
                   <span>{row.backendRuntimeId}</span>
+                  <div className="runtime-actions">
+                    {!row.loaded ? (
+                      <button className="secondary" onClick={() => deploymentAction("load", row.deploymentId).catch((error: Error) => setMessage(error.message))}>
+                        Load
+                      </button>
+                    ) : null}
+                    {row.loaded && row.sleepEnabled && row.state === "ready" ? (
+                      <button className="secondary" onClick={() => deploymentAction("sleep", row.deploymentId).catch((error: Error) => setMessage(error.message))}>
+                        Sleep
+                      </button>
+                    ) : null}
+                    {row.loaded && SLEEP_STATES.has(row.state) ? (
+                      <button className="secondary" onClick={() => deploymentAction("wake", row.deploymentId).catch((error: Error) => setMessage(error.message))}>
+                        Wake
+                      </button>
+                    ) : null}
+                    {row.loaded ? (
+                      <button className="secondary danger" title="Stop the process completely and free all memory"
+                        onClick={() => deploymentAction("unload", row.deploymentId).catch((error: Error) => setMessage(error.message))}>
+                        Stop
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
               ))
             ) : (
