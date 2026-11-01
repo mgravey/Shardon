@@ -25,24 +25,38 @@ class BackendRegistry:
         self.supervisor = ProcessSupervisor(state_root)
 
     def resolve_backend(
-        self, backend_runtime_id: str, *, gpu_group_id: str | None = None
+        self,
+        backend_runtime_id: str,
+        *,
+        gpu_group_id: str | None = None,
+        port: int | None = None,
     ) -> BackendRuntimeConfig:
         backend = self.config.backends[backend_runtime_id]
-        return backend.resolved_for_gpu_group(gpu_group_id)
+        return backend.resolved_for_gpu_group(gpu_group_id).with_port(port)
 
     def adapter_for(
         self,
         backend_runtime_id: str,
         *,
         gpu_group_id: str | None = None,
+        port: int | None = None,
     ) -> BackendAdapter:
-        backend = self.resolve_backend(backend_runtime_id, gpu_group_id=gpu_group_id)
+        backend = self.resolve_backend(backend_runtime_id, gpu_group_id=gpu_group_id, port=port)
         if backend.backend_type == "whisperx":
             return WhisperXBackendAdapter(backend)
         return OpenAIHTTPBackendAdapter(backend)
 
-    def ensure_started(self, deployment: DeploymentConfig, *, gpu_group_id: str) -> int:
-        backend = self.resolve_backend(deployment.backend_runtime_id, gpu_group_id=gpu_group_id)
+    def ensure_started(
+        self,
+        deployment: DeploymentConfig,
+        *,
+        gpu_group_id: str,
+        port: int | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> int:
+        backend = self.resolve_backend(
+            deployment.backend_runtime_id, gpu_group_id=gpu_group_id, port=port
+        )
         model = self.config.models.get(deployment.model_id)
         runtime_launch_args: list[str] = []
         if model is not None:
@@ -66,6 +80,15 @@ class BackendRegistry:
                     "SHARDON_API_MODEL_NAME": deployment.api_model_name,
                     "SHARDON_GPU_GROUP_ID": gpu_group_id,
                     "SHARDON_MODEL_RUNTIME_LAUNCH_ARGS": " ".join(runtime_launch_args),
+                    **(
+                        {
+                            "IGF_SHARDON_RUNTIME_PORT": str(port),
+                            "SHARDON_RUNTIME_PORT": str(port),
+                        }
+                        if port is not None
+                        else {}
+                    ),
+                    **(extra_env or {}),
                 },
             )
         except (OSError, ValueError) as exc:
@@ -85,6 +108,7 @@ class BackendRegistry:
             backend_runtime_id=deployment.backend_runtime_id,
             gpu_group_id=gpu_group_id,
             pid=managed.pid,
+            port=port,
         )
         return managed.pid
 
@@ -93,6 +117,8 @@ class BackendRegistry:
         deployment: DeploymentConfig,
         *,
         gpu_group_id: str,
+        port: int | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         backend = self.resolve_backend(deployment.backend_runtime_id, gpu_group_id=gpu_group_id)
         timeout_seconds = (
@@ -103,7 +129,9 @@ class BackendRegistry:
             backend.readiness_poll_interval_seconds
             or self.config.global_config.backend_readiness_poll_interval_seconds
         )
-        pid = self.ensure_started(deployment, gpu_group_id=gpu_group_id)
+        pid = self.ensure_started(
+            deployment, gpu_group_id=gpu_group_id, port=port, extra_env=extra_env
+        )
         managed = self.supervisor.processes.get(deployment.id)
         start_monotonic = asyncio.get_event_loop().time()
         last_error = "backend did not report readiness"
@@ -126,6 +154,7 @@ class BackendRegistry:
                 payload = await self.health(
                     deployment.backend_runtime_id,
                     gpu_group_id=gpu_group_id,
+                    **({"port": port} if port is not None else {}),
                 )
                 detail = {
                     "deployment_id": deployment.id,
@@ -133,6 +162,7 @@ class BackendRegistry:
                     "gpu_group_id": gpu_group_id,
                     "pid": pid,
                     "attempt_count": attempt_count,
+                    "port": port,
                     "ready_at": utc_now_iso(),
                     "payload": payload,
                 }
@@ -211,6 +241,7 @@ class BackendRegistry:
         backend_runtime_id: str,
         *,
         gpu_group_id: str | None = None,
+        port: int | None = None,
     ) -> dict[str, Any]:
-        adapter = self.adapter_for(backend_runtime_id, gpu_group_id=gpu_group_id)
+        adapter = self.adapter_for(backend_runtime_id, gpu_group_id=gpu_group_id, port=port)
         return await adapter.health()

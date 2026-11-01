@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -23,6 +24,10 @@ class GlobalConfig(BaseModel):
     backend_startup_timeout_seconds: int | None = None
     backend_readiness_poll_interval_seconds: float = 1.0
     backend_stop_timeout_seconds: int = 30
+    # Host-wide cap on simultaneously sleeping deployments (all GPU groups).
+    # Level-1 sleep parks weights in host RAM, so this bounds RAM pressure.
+    # None keeps sleeping unlimited; sleep itself is opt-in per backend.
+    max_sleeping_deployments: int | None = Field(default=None, ge=0)
 
     def effective_interactive_request_timeout_seconds(self) -> int:
         if self.interactive_request_timeout_seconds is not None:
@@ -68,6 +73,115 @@ class BackendCapabilities(BaseModel):
         return self
 
 
+class SleepConfig(BaseModel):
+    """vLLM sleep-mode settings. Every field is optional so that a deployment
+    can override individual backend values; see ``SleepPolicy`` for defaults."""
+
+    enabled: bool | None = None
+    level: Literal[1, 2] | None = None
+    idle_seconds: int | None = Field(default=None, ge=0)
+    mode: Literal["wait", "abort"] | None = None
+    sleep_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    wake_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    sleep_on_evict: bool | None = None
+    # Stop (fully unload) a deployment that has been asleep this long.
+    max_sleep_seconds: int | None = Field(default=None, ge=0)
+    # GPU memory a sleeping process keeps (CUDA context, allocator pools).
+    sleeping_memory_fraction: float | None = Field(default=None, ge=0, le=1)
+
+    def merged_with(self, override: SleepConfig | None) -> SleepConfig:
+        if override is None:
+            return self
+        return self.model_copy(update=override.model_dump(exclude_none=True))
+
+
+class SleepPolicy(BaseModel):
+    """Effective sleep settings after merging backend and deployment config."""
+
+    enabled: bool = False
+    level: Literal[1, 2] = 1
+    idle_seconds: int = 600
+    mode: Literal["wait", "abort"] = "wait"
+    sleep_timeout_seconds: float = 120.0
+    wake_timeout_seconds: float = 120.0
+    sleep_on_evict: bool = False
+    max_sleep_seconds: int | None = None
+    sleeping_memory_fraction: float = 0.05
+
+    @classmethod
+    def resolve(cls, *configs: SleepConfig | None) -> SleepPolicy:
+        merged = SleepConfig()
+        for config in configs:
+            merged = merged.merged_with(config)
+        return cls.model_validate(merged.model_dump(exclude_none=True))
+
+
+class KvcachedConfig(BaseModel):
+    """kvcached (elastic KV cache) controls, applied with ``kvctl`` after
+    readiness. Sizes use kvctl syntax (``512M``, ``24G``, raw bytes)."""
+
+    enabled: bool | None = None
+    limit: str | None = None
+    limit_percent: float | None = Field(default=None, gt=0, le=100)
+    min: str | None = None
+    priority: int | None = None
+    headroom: str | None = None
+    # Defaults to igf-shardon-<deployment id>; a KVCACHED_IPC_NAME in the
+    # backend environment always wins.
+    ipc_name: str | None = None
+    kvctl_path: str | None = None
+    command_timeout_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("limit", "min", "headroom")
+    @classmethod
+    def _validate_size(cls, value: str | None) -> str | None:
+        if value is not None:
+            parse_size_bytes(value)
+        return value
+
+    def merged_with(self, override: KvcachedConfig | None) -> KvcachedConfig:
+        if override is None:
+            return self
+        return self.model_copy(update=override.model_dump(exclude_none=True))
+
+    def limit_fraction(self, total_bytes: int) -> float:
+        """Per-instance KV ceiling as a fraction of device memory (0 if unset)."""
+        if self.limit is not None and total_bytes > 0:
+            return min(1.0, parse_size_bytes(self.limit) / total_bytes)
+        if self.limit_percent is not None:
+            return self.limit_percent / 100.0
+        return 0.0
+
+
+_SIZE_SUFFIXES = {
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+}
+
+
+def parse_size_bytes(value: str | int) -> int:
+    """Parse kvctl-style sizes (``512M``, ``1g``, ``100_000``) into bytes."""
+    text = str(value).strip().lower().replace(",", "").replace("_", "")
+    for suffix, multiplier in sorted(_SIZE_SUFFIXES.items(), key=lambda kv: -len(kv[0])):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)] or "0"
+            try:
+                return int(float(number) * multiplier)
+            except ValueError as exc:
+                raise ValueError(f"invalid size {value!r}") from exc
+    try:
+        return int(float(text))
+    except ValueError as exc:
+        raise ValueError(f"invalid size {value!r}") from exc
+
+
 class BackendRuntimeConfig(BaseModel):
     id: str
     backend_type: Literal["vllm", "sglang", "mock", "whisperx"]
@@ -86,6 +200,48 @@ class BackendRuntimeConfig(BaseModel):
     stop_timeout_seconds: int | None = None
     gpu_group_overrides: dict[str, "BackendRuntimeOverride"] = Field(default_factory=dict)
     capabilities: BackendCapabilities = Field(default_factory=BackendCapabilities)
+    sleep: SleepConfig | None = None
+    kvcached: KvcachedConfig | None = None
+    # Inclusive [first, last] range of ports Shardon allocates per deployment.
+    # The allocated port replaces the base_url port and is passed to the
+    # launch command as IGF_SHARDON_RUNTIME_PORT. Unset: single shared port.
+    port_range: tuple[int, int] | None = None
+    # Simpler alternative to port_range: the first deployment gets the
+    # base_url port, the next one that port + 1, and so on (lowest free port
+    # first, up to max_deployment_ports ports).
+    per_deployment_ports: bool = False
+    max_deployment_ports: int = Field(default=16, ge=1, le=1024)
+
+    @field_validator("port_range")
+    @classmethod
+    def _validate_port_range(cls, value: tuple[int, int] | None) -> tuple[int, int] | None:
+        if value is not None and not (1 <= value[0] <= value[1] <= 65535):
+            raise ValueError("port_range must be [first, last] with 1 <= first <= last <= 65535")
+        return value
+
+    def effective_port_range(self) -> tuple[int, int] | None:
+        """Inclusive port range for per-deployment ports, or None (shared port)."""
+        if self.port_range is not None:
+            return self.port_range
+        if not self.per_deployment_ports:
+            return None
+        parts = urlsplit(self.base_url)
+        base_port = parts.port or (443 if parts.scheme == "https" else 80)
+        return base_port, min(65535, base_port + self.max_deployment_ports - 1)
+
+    def with_port(self, port: int | None) -> BackendRuntimeConfig:
+        """Return a copy whose base_url targets ``port`` (no-op for None)."""
+        if port is None:
+            return self
+        parts = urlsplit(self.base_url)
+        host = parts.hostname or "127.0.0.1"
+        if ":" in host:
+            host = f"[{host}]"
+        netloc = f"{host}:{port}"
+        if parts.username:
+            credentials = parts.username + (f":{parts.password}" if parts.password else "")
+            netloc = f"{credentials}@{netloc}"
+        return self.model_copy(update={"base_url": urlunsplit(parts._replace(netloc=netloc))})
 
     def resolved_for_gpu_group(self, gpu_group_id: str | None) -> "BackendRuntimeConfig":
         if gpu_group_id is None:
@@ -217,6 +373,14 @@ class DeploymentConfig(BaseModel):
         ]
     ] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
+    sleep: SleepConfig | None = None
+    kvcached: KvcachedConfig | None = None
+    # Fixed port for this deployment (overrides the backend port/port_range).
+    port: int | None = Field(default=None, ge=1, le=65535)
+    # Elastic groups: estimated resident footprint (weights + kvcached
+    # reserve) used until the real footprint is observed after readiness.
+    # Defaults to the deployment memory fraction.
+    resident_memory_fraction: float | None = Field(default=None, gt=0, le=1)
 
     @model_validator(mode="after")
     def normalize_gpu_groups(self) -> "DeploymentConfig":
@@ -273,6 +437,12 @@ class GPUGroupConfig(BaseModel):
     usable_memory_fraction: float = 0.95
     keep_free: bool = False
     scheduling_tags: list[str] = Field(default_factory=list)
+    # Cap on simultaneously sleeping deployments in this group. When exceeded,
+    # the least recently used sleepers are stopped. None means unlimited.
+    max_sleeping: int | None = Field(default=None, ge=0)
+    # static: one awake deployment at a time (historic behaviour).
+    # elastic: deployments co-reside while their resident footprints fit.
+    memory_model: Literal["static", "elastic"] = "static"
 
 
 class APIKeyRecord(BaseModel):
@@ -310,3 +480,35 @@ class RepositoryConfig(BaseModel):
     gpu_groups: dict[str, GPUGroupConfig]
     admin_users: dict[str, AdminUserRecord]
     policies: dict[str, Any] = Field(default_factory=dict)
+
+    def sleep_policy_for(self, deployment_id: str) -> SleepPolicy:
+        deployment = self.deployments.get(deployment_id)
+        if deployment is None:
+            return SleepPolicy()
+        backend = self.backends.get(deployment.backend_runtime_id)
+        return SleepPolicy.resolve(backend.sleep if backend else None, deployment.sleep)
+
+    def kvcached_for(self, deployment_id: str) -> KvcachedConfig | None:
+        """Effective kvcached settings, or None when kvcached is not in use.
+
+        kvcached counts as in use when either config block enables it (or
+        sets any control), or the backend environment sets ENABLE_KVCACHED.
+        """
+        deployment = self.deployments.get(deployment_id)
+        if deployment is None:
+            return None
+        backend = self.backends.get(deployment.backend_runtime_id)
+        merged = (KvcachedConfig().merged_with(backend.kvcached if backend else None)).merged_with(
+            deployment.kvcached
+        )
+        env_enabled = backend is not None and str(
+            backend.environment.get("ENABLE_KVCACHED", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        configured = backend is not None and backend.kvcached is not None or (
+            deployment.kvcached is not None
+        )
+        if merged.enabled is False:
+            return None
+        if merged.enabled or env_enabled or configured:
+            return merged
+        return None

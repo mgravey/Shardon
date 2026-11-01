@@ -276,6 +276,7 @@ def create_app() -> FastAPI:
         runtime.refresh_gpu_observations()
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
+        await runtime.refresh_kvcached_usage()
         return runtime.status()
 
     @app.get("/runtime/activity", response_model=ActivityResponse)
@@ -384,6 +385,48 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         try:
             return await runtime.unload_deployment(deployment_id, actor=username)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/sleep/{deployment_id}")
+    async def runtime_sleep_deployment(
+        deployment_id: str,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.sleep_deployment(deployment_id, actor=username, source="manual")
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/wake/{deployment_id}")
+    async def runtime_wake_deployment(
+        deployment_id: str,
+        username: str = Depends(admin_user),
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.wake_deployment(deployment_id, actor=username)
+        except RuntimeOperationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    @app.post("/runtime/activity/deployments/{deployment_id}/sleep")
+    async def public_sleep_deployment(
+        deployment_id: str,
+        request: Request,
+        runtime: ShardonRuntime = Depends(get_runtime),
+    ) -> dict[str, Any]:
+        # Public, like the activity view: anyone may ask an idle, sleep-enabled
+        # deployment to release its GPU memory. It refuses while requests are
+        # in flight or queued, and the next request wakes it again.
+        client = request.client.host if request.client else "unknown"
+        try:
+            return await runtime.sleep_deployment(
+                deployment_id,
+                actor=f"public:{client}",
+                source="public",
+                require_idle=True,
+            )
         except RuntimeOperationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

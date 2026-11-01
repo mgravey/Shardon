@@ -90,6 +90,11 @@ async def _run_background_tick(runtime: ShardonRuntime) -> None:
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
         await runtime.process_one_batch()
+        # Idle sleep (opt-in per backend/deployment) and sleeping caps.
+        await runtime.sleep_idle_deployments()
+        # Elastic groups: replace footprint estimates with observed values.
+        await runtime.refresh_elastic_footprints()
+        await runtime.refresh_kvcached_usage()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -328,6 +333,7 @@ def create_app() -> FastAPI:
         runtime.refresh_gpu_observations()
         runtime.enforce_keep_free()
         await runtime.refresh_backend_health()
+        await runtime.refresh_kvcached_usage()
         return runtime.status()
 
     @app.get("/shardon/batches/{batch_id}/progress")

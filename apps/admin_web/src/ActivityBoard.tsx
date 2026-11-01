@@ -5,12 +5,20 @@ type RequestActivity = {
   phase: "waiting" | "loading" | "in_flight"; elapsed_seconds: number; wait_seconds: number;
   wait_reason: string | null; deployment_id: string; gpu_group_id: string;
 };
+type DeploymentActivity = {
+  id: string; state: string; gpu_group_id: string | null;
+  sleep_enabled?: boolean; can_sleep?: boolean; slept_at?: string | null;
+  port?: number | null; kv_used_bytes?: number | null; kv_limit_bytes?: number | null;
+};
+const kvTitle = (d: DeploymentActivity) => typeof d.kv_used_bytes === "number"
+  ? `KV cache in use: ${(d.kv_used_bytes / 1024 ** 3).toFixed(1)} GiB${typeof d.kv_limit_bytes === "number" && d.kv_limit_bytes > 0 ? ` of ${(d.kv_limit_bytes / 1024 ** 3).toFixed(1)} GiB` : ""}`
+  : undefined;
 type Activity = {
   generated_at: string; in_flight: number; waiting: number; loading: number;
   models: Array<{
     model_name: string; in_flight: number; waiting: number; loading: number;
     oldest_wait_seconds: number; requests: RequestActivity[];
-    deployments: Array<{ id: string; state: string; gpu_group_id: string | null }>;
+    deployments: DeploymentActivity[];
   }>;
   batches: Array<{
     id: string; user_name: string; api_key_id: string; model_name: string; status: string;
@@ -69,6 +77,40 @@ function usePolling<T>(path: string, interval: number) {
   return { data, error, updated, refreshing };
 }
 
+export const SLEEP_STATES = new Set(["sleeping", "falling_asleep", "waking"]);
+export const stateLabel = (state: string) => ({
+  ready: "Loaded", sleeping: "Sleeping", falling_asleep: "Falling asleep", waking: "Waking",
+  starting: "Loading", stopping: "Stopping", failed: "Failed", unloaded: "Unloaded",
+}[state] ?? state);
+
+async function requestPublicSleep(deploymentId: string): Promise<string> {
+  // Public control (no admin sign-in): the server only accepts it for idle,
+  // sleep-enabled deployments. The next request wakes the model again.
+  const response = await fetch(`/api/runtime/activity/deployments/${encodeURIComponent(deploymentId)}/sleep`, { method: "POST" });
+  if (response.ok) return `${deploymentId} is asleep. Its GPU memory is free; the next request wakes it.`;
+  let reason = `${response.status}`;
+  try {
+    const body = await response.json() as { detail?: { reason?: string; error?: string } | string };
+    reason = typeof body.detail === "string" ? body.detail : body.detail?.reason ?? body.detail?.error ?? reason;
+  } catch { /* keep status code */ }
+  return `Could not put ${deploymentId} to sleep: ${reason}`;
+}
+
+function SleepButton({ deployment, onResult }: { deployment: DeploymentActivity; onResult: (message: string) => void }) {
+  const [busy, setBusy] = useState(false);
+  // Only offered while the model is awake and idle: nothing in flight,
+  // nothing waiting, no batch work (computed server-side as can_sleep).
+  if (!deployment.can_sleep) return null;
+  return <button className="secondary chip-action" disabled={busy}
+    title="Release this model's GPU memory now. It keeps its process and wakes on the next request."
+    onClick={event => {
+      // The button lives inside <summary>; do not toggle the details row.
+      event.preventDefault(); event.stopPropagation();
+      setBusy(true);
+      void requestPublicSleep(deployment.id).then(onResult).finally(() => setBusy(false));
+    }}>{busy ? "Sleeping…" : "Sleep"}</button>;
+}
+
 const count = (value: number | null) => value === null ? "Unavailable" : value.toLocaleString();
 const duration = (value: number) => value < 60 ? `${Math.floor(value)}s` : `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
 const phaseLabel = (phase: string) => ({ in_flight: "In flight", loading: "Loading model", waiting: "Waiting" }[phase] ?? phase);
@@ -83,8 +125,9 @@ function Freshness({ error, updated, refreshing }: { error: string; updated: Dat
 export function LoadedModelsBanner() {
   // Keep the global loaded-model display independent of the activity filters.
   const activity = usePolling<Activity>("/runtime/activity", 2000);
+  const resident = (state: string) => state === "ready" || SLEEP_STATES.has(state);
   const loaded = activity.data?.models.filter(model =>
-    model.deployments.some(deployment => deployment.state === "ready"),
+    model.deployments.some(deployment => resident(deployment.state)),
   ) ?? [];
   const loading = activity.data?.models.filter(model =>
     model.deployments.some(deployment => deployment.state === "starting"),
@@ -96,13 +139,13 @@ export function LoadedModelsBanner() {
         : !activity.data ? (activity.error ? "Model status unavailable" : "Checking loaded models…")
         : "No model loaded"}
     </h1>
-    {loaded.map(model => <p className="loaded-model-placement" key={model.model_name}>
-      <span className="status-pill status-ready">Loaded</span>
-      {loaded.length > 1 && <strong>{model.model_name}</strong>}
-      {model.deployments.filter(deployment => deployment.state === "ready").map(deployment =>
-        <span key={deployment.id}>{deployment.id}{deployment.gpu_group_id ? ` · ${deployment.gpu_group_id}` : ""}</span>,
-      )}
-    </p>)}
+    {loaded.map(model => model.deployments.filter(deployment => resident(deployment.state)).map(deployment =>
+      <p className="loaded-model-placement" key={deployment.id}>
+        <span className={`status-pill status-${deployment.state}`}>{stateLabel(deployment.state)}</span>
+        {loaded.length > 1 && <strong>{model.model_name}</strong>}
+        <span>{deployment.id}{deployment.gpu_group_id ? ` · ${deployment.gpu_group_id}` : ""}</span>
+        {deployment.state === "sleeping" && <small>Wakes on the next request</small>}
+      </p>))}
     {loading.length > 0 && <p className="loaded-model-loading">Loading: {loading.map(model => model.model_name).join(", ")}</p>}
     <Freshness {...activity} />
   </div>;
@@ -130,6 +173,7 @@ export default function ActivityBoard() {
   const activity = usePolling<Activity>(`/runtime/activity?${filters}`, 2000);
   const usage = usePolling<Usage>(`/runtime/usage?${filters}&period=${period}&group_by=${groupBy}&model_view=${modelView}`, 30000);
   const filtered = Boolean(model || apiKey || user);
+  const [controlMessage, setControlMessage] = useState("");
   return <div className="observability">
     <section className="panel activity-panel" aria-labelledby="activity-title">
       <div className="panel-header activity-heading"><div>
@@ -147,11 +191,15 @@ export default function ActivityBoard() {
         <span><strong>{activity.data?.waiting ?? "—"}</strong> Waiting <small>(includes loading)</small></span>
         <span><strong>{activity.data?.loading ?? "—"}</strong> Loading model</span>
       </div>
+      {controlMessage && <p className="control-message" role="status">{controlMessage}</p>}
       {!activity.data && <p className="empty-state">{activity.error ? "Activity is unavailable. Retrying automatically." : "Loading activity…"}</p>}
       {activity.data?.models.length === 0 && <p className="empty-state">No models or requests match these filters.</p>}
       {activity.data?.models.map(row => <details className="model-activity" key={row.model_name}>
         <summary><strong>{row.model_name}</strong>
-          <span className="model-deployments">{row.deployments.map(d => <span key={d.id} className={`status-pill status-${d.state}`}>{d.id}: {d.state}{d.gpu_group_id ? ` · ${d.gpu_group_id}` : ""}</span>)}</span>
+          <span className="model-deployments">{row.deployments.map(d => <span key={d.id} className="deployment-chip">
+            <span className={`status-pill status-${d.state}`} title={kvTitle(d)}>{d.id}: {stateLabel(d.state)}{d.gpu_group_id ? ` · ${d.gpu_group_id}` : ""}{typeof d.kv_used_bytes === "number" ? ` · KV ${(d.kv_used_bytes / 1024 ** 3).toFixed(1)} GiB` : ""}</span>
+            <SleepButton deployment={d} onResult={setControlMessage} />
+          </span>)}</span>
           <span className="activity-model-counts"><b>{row.in_flight}</b> in flight · <b>{row.waiting}</b> waiting{row.loading > 0 && ` · ${row.loading} loading`}<small>Oldest wait: {row.waiting ? duration(row.oldest_wait_seconds) : "—"}</small></span>
         </summary>
         {row.requests.length === 0 ? <p className="empty-state">No active or waiting requests.</p> : <div className="table-scroll"><table className="activity-table">
