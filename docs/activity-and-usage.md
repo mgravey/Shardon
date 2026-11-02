@@ -121,6 +121,24 @@ preserved: those cases cannot safely prove that the request was abandoned. Upgra
 therefore does not automatically clear pre-upgrade orphaned requests. Such legacy
 state requires operator reconciliation after independently verifying router ownership.
 
+### Backends stopped by a router restart
+
+Backend processes are children of the router that launched them, so a service
+restart or redeploy stops them with it. Each loaded deployment records the launching
+router instance in `process_owner_instance_id`. When reconciliation finds a tracked
+backend process gone and that owner's lock proves the router has ended, the deployment
+becomes `unloaded`, not `failed`, with the reason
+`state reconciliation: backend stopped with its router (router restart)` and a
+`backend.recovery` event with `recovery_result: unloaded_with_router`. A backend that
+dies while its router is still alive, or that has no recorded owner (state written
+before this change), is marked `failed`. If a backend outlives its launching router,
+the next router adopts it and becomes its owner.
+
+The activity API returns `state_reason` for failed and unloaded deployments: the last
+error or, failing that, the last transition reason. The activity board shows it as
+the status chip tooltip, and the admin deployments table shows the last transition
+reason when hovering the status.
+
 All cooperating routers must use the same state directory on a filesystem supporting
 cross-process `flock` locks and atomic replacement. Keep `routers/` lock files with
 their runtime state; do not delete or replace them while routers are running. Empty

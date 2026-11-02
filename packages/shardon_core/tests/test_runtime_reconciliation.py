@@ -15,6 +15,7 @@ from shardon_core.auth.service import AuthResult
 from shardon_core.gpu.provider import MockGPUProvider
 from shardon_core.services.runtime import RuntimeOperationError, ShardonRuntime
 from shardon_core.state.models import DeploymentRuntimeState
+from shardon_core.state.ownership import RouterInstance
 
 
 def _source_repo_root() -> Path:
@@ -526,3 +527,111 @@ def test_slow_request_fails_without_backend_restart(
     assert snapshot.queued_requests == []
     assert snapshot.active_requests == {}
     assert snapshot.deployments["chat-a"].active_request_ids == []
+
+
+def _reconcile_with_dead_pid(
+    runtime: ShardonRuntime, monkeypatch, *, owner_id: str | None
+) -> DeploymentRuntimeState:
+    def seed(snapshot):  # type: ignore[no-untyped-def]
+        state = _loaded_chat_state(runtime, pid=4_401)
+        state.process_owner_instance_id = owner_id
+        return snapshot.model_copy(update={"deployments": {"chat-a": state}})
+
+    runtime.state_store.mutate(seed)
+
+    def process_is_dead(pid: int, signal_number: int) -> None:
+        _ = signal_number
+        if pid == 4_401:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr("shardon_core.services.runtime.os.kill", process_is_dead)
+    runtime.state_store.mutate(runtime._reconcile_loaded_processes)
+    return runtime.snapshot().deployments["chat-a"]
+
+
+def test_backend_stopped_with_exited_router_is_unloaded_not_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = ShardonRuntime(repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider())
+    old_router = RouterInstance(runtime.state_root)
+    old_router.close()
+
+    state = _reconcile_with_dead_pid(runtime, monkeypatch, owner_id=old_router.id)
+
+    assert state.state == "unloaded"
+    assert state.loaded is False
+    assert state.process_id is None
+    assert state.process_owner_instance_id is None
+    assert state.last_error is None
+    assert "router restart" in (state.last_transition_reason or "")
+    events = [
+        json.loads(line)
+        for line in (runtime.state_root / "events" / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(e["data"].get("recovery_result") == "unloaded_with_router" for e in events)
+
+
+def test_backend_dead_while_its_router_lives_is_failed(tmp_path: Path, monkeypatch) -> None:
+    runtime = ShardonRuntime(repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider())
+    live_router = RouterInstance(runtime.state_root)
+    try:
+        state = _reconcile_with_dead_pid(runtime, monkeypatch, owner_id=live_router.id)
+    finally:
+        live_router.close()
+
+    assert state.state == "failed"
+    assert state.last_error == "tracked backend process is not running"
+
+
+def test_backend_without_recorded_owner_is_failed(tmp_path: Path, monkeypatch) -> None:
+    runtime = ShardonRuntime(repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider())
+
+    state = _reconcile_with_dead_pid(runtime, monkeypatch, owner_id=None)
+
+    assert state.state == "failed"
+
+
+def test_router_adopts_backend_that_outlived_its_launching_router(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = ShardonRuntime(repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider())
+    old_router = RouterInstance(runtime.state_root)
+    old_router.close()
+
+    def seed(snapshot):  # type: ignore[no-untyped-def]
+        state = _loaded_chat_state(runtime, pid=4_501)
+        state.process_owner_instance_id = old_router.id
+        return snapshot.model_copy(update={"deployments": {"chat-a": state}})
+
+    runtime.state_store.mutate(seed)
+    monkeypatch.setattr("shardon_core.services.runtime.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr(runtime, "_ensure_supervised_process", lambda *args: None)
+    runtime.start_router()
+    try:
+        runtime.state_store.mutate(runtime._reconcile_loaded_processes)
+        state = runtime.snapshot().deployments["chat-a"]
+        assert state.state == "ready"
+        assert state.process_owner_instance_id == runtime._router_instance.id
+    finally:
+        runtime.stop_router()
+
+
+def test_mark_loaded_records_owning_router(tmp_path: Path) -> None:
+    runtime = ShardonRuntime(repo_root=_copy_repo_fixture(tmp_path), gpu_provider=MockGPUProvider())
+    deployment = runtime.config.deployments["chat-a"]
+    runtime.start_router()
+    try:
+        runtime.state_store.mutate(
+            lambda snapshot: runtime._mark_loaded(
+                snapshot,
+                deployment,
+                selected_gpu_group_id=deployment.preferred_gpu_group_id(),
+                pid=4_601,
+                reason="test",
+                readiness_detail={},
+            )
+        )
+        state = runtime.snapshot().deployments["chat-a"]
+        assert state.process_owner_instance_id == runtime._router_instance.id
+    finally:
+        runtime.stop_router()

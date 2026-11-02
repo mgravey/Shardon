@@ -95,6 +95,10 @@ class DeploymentRuntimeState(BaseModel):
     active_request_ids: list[str] = Field(default_factory=list)
     keep_free_killed_at: str | None = None
     process_id: int | None = None
+    # Router instance whose process launched process_id. Backends are children
+    # of that router, so they stop with it; a dead backend whose owner has also
+    # exited was stopped by a router restart, not by a crash.
+    process_owner_instance_id: str | None = None
     current_model_name: str | None = None
     last_error: str | None = None
     last_transition_reason: str | None = None

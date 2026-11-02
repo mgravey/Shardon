@@ -13,7 +13,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from shardon_core.config.schemas import RepositoryConfig
-from shardon_core.state.models import ActiveRequest, RuntimeStateSnapshot
+from shardon_core.state.models import ActiveRequest, DeploymentRuntimeState, RuntimeStateSnapshot
 from shardon_core.state.sleep_rules import sleep_refusal
 from shardon_core.utils.files import append_jsonl, locked_file
 from shardon_core.utils.time import utc_now
@@ -377,6 +377,17 @@ class ActivityDeployment(BaseModel):
     port: int | None = None
     kv_used_bytes: int | None = None
     kv_limit_bytes: int | None = None
+    # Why the deployment is failed or unloaded (error or last transition), so
+    # a crash can be told apart from a planned stop or a router restart.
+    state_reason: str | None = None
+
+
+def _state_reason(state: DeploymentRuntimeState | None) -> str | None:
+    if state is None or state.state not in {"failed", "unloaded"}:
+        return None
+    if state.state == "failed":
+        return state.last_error or state.last_transition_reason
+    return state.last_transition_reason
 
 
 class ModelActivity(BaseModel):
@@ -460,6 +471,7 @@ def activity_snapshot(
                 port=state.port if state else None,
                 kv_used_bytes=snapshot.kvcached_usage.get(deployment.id, {}).get("used_bytes"),
                 kv_limit_bytes=snapshot.kvcached_usage.get(deployment.id, {}).get("limit_bytes"),
+                state_reason=_state_reason(state),
             )
         )
     unique = {r.id: r for r in snapshot.queued_requests if r.status == "queued"}
