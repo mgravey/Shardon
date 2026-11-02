@@ -24,15 +24,22 @@ class RouterInstance:
         self._handle.close()
 
     def terminated(self, instance_id: str | None) -> bool:
-        if instance_id is None or instance_id == self.id:
+        if instance_id == self.id:
             return False
-        # Unknown/legacy owners are not evidence of termination. Also avoid
-        # interpreting persisted identifiers as arbitrary filesystem paths.
-        try:
-            if uuid.UUID(instance_id).hex != instance_id:
-                return False
-            with (self.root / f"{instance_id}.lock").open("r+") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return True
-        except (OSError, ValueError):
+        return router_instance_terminated(self.root.parent, instance_id)
+
+
+def router_instance_terminated(state_root: Path, instance_id: str | None) -> bool:
+    """True only when the router instance's witness lock is provably released."""
+    if instance_id is None:
+        return False
+    # Unknown/legacy owners are not evidence of termination. Also avoid
+    # interpreting persisted identifiers as arbitrary filesystem paths.
+    try:
+        if uuid.UUID(instance_id).hex != instance_id:
             return False
+        with (state_root / "routers" / f"{instance_id}.lock").open("r+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+    except (OSError, ValueError):
+        return False

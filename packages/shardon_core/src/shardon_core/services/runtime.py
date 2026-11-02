@@ -53,7 +53,7 @@ from shardon_core.state.models import (
     DrainState,
     RuntimeStateSnapshot,
 )
-from shardon_core.state.ownership import RouterInstance
+from shardon_core.state.ownership import RouterInstance, router_instance_terminated
 from shardon_core.state.sleep_rules import sleep_refusal
 from shardon_core.state.store import RuntimeStateStore
 from shardon_core.utils.process_tree import process_tree
@@ -335,6 +335,7 @@ class ShardonRuntime:
                     state.state = "unloaded"
                     state.desired_state = "unloaded"
                     state.process_id = None
+                    state.process_owner_instance_id = None
                     state.keep_free_killed_at = utc_now_iso()
                     state.active_request_ids = []
                     state.resident_memory_fraction = 0.0
@@ -3126,8 +3127,31 @@ class ShardonRuntime:
                 os.kill(runtime_state.process_id, 0)
             except OSError:
                 old_pid = runtime_state.process_id
-                reason = "state reconciliation: tracked process is not running"
                 self.backends.supervisor.processes.pop(deployment_id, None)
+                owner_id = runtime_state.process_owner_instance_id
+                if router_instance_terminated(self.state_root, owner_id):
+                    # The backend was a child of a router that has since
+                    # exited (service restart or redeploy): it was stopped
+                    # with its router, which is not a backend failure.
+                    reason = (
+                        "state reconciliation: backend stopped with its router (router restart)"
+                    )
+                    gpu_group_id = runtime_state.selected_gpu_group_id or runtime_state.gpu_group_id
+                    self._mark_unloaded(snapshot, deployment_id, reason=reason)
+                    runtime_state.last_error = None
+                    self.event_logger.emit(
+                        "backend.recovery",
+                        "marked deployment unloaded after its router stopped",
+                        deployment_id=deployment_id,
+                        backend_runtime_id=runtime_state.backend_runtime_id,
+                        gpu_group_id=gpu_group_id,
+                        old_pid=old_pid,
+                        old_router_instance_id=owner_id,
+                        reason=reason,
+                        recovery_result="unloaded_with_router",
+                    )
+                    continue
+                reason = "state reconciliation: tracked process is not running"
                 self._mark_unavailable(
                     snapshot,
                     deployment_id,
@@ -3145,6 +3169,15 @@ class ShardonRuntime:
                     recovery_result="marked_unavailable",
                 )
                 continue
+            owner = self._router_instance
+            if (
+                owner is not None
+                and runtime_state.process_owner_instance_id != owner.id
+                and owner.terminated(runtime_state.process_owner_instance_id)
+            ):
+                # The backend outlived its launching router; this router now
+                # supervises it, so a later death is a real failure.
+                runtime_state.process_owner_instance_id = owner.id
             self._ensure_supervised_process(deployment_id, runtime_state)
         return snapshot
 
@@ -3352,6 +3385,7 @@ class ShardonRuntime:
         runtime.loaded_at = utc_now_iso()
         runtime.readiness_passed_at = readiness_detail.get("ready_at", utc_now_iso())
         runtime.process_id = pid
+        runtime.process_owner_instance_id = self._ensure_router_instance().id
         group = self.config.gpu_groups.get(selected_gpu_group_id)
         if group is not None and group.memory_model == "elastic":
             runtime.resident_memory_fraction = self.scheduler.elastic_footprint_estimate(
@@ -3407,6 +3441,7 @@ class ShardonRuntime:
         runtime.state = "failed"
         runtime.desired_state = "unloaded"
         runtime.process_id = None
+        runtime.process_owner_instance_id = None
         runtime.resident_memory_fraction = 0.0
         runtime.last_error = detail.get("error")
         runtime.last_transition_reason = reason
@@ -3430,6 +3465,7 @@ class ShardonRuntime:
         runtime.desired_state = "unloaded"
         runtime.selected_gpu_group_id = None
         runtime.process_id = None
+        runtime.process_owner_instance_id = None
         runtime.resident_memory_fraction = 0.0
         if not preserve_active_requests:
             runtime.active_request_ids = []
@@ -3452,6 +3488,7 @@ class ShardonRuntime:
         runtime.desired_state = "unloaded"
         runtime.selected_gpu_group_id = None
         runtime.process_id = None
+        runtime.process_owner_instance_id = None
         runtime.resident_memory_fraction = 0.0
         runtime.active_request_ids = []
         runtime.last_transition_reason = reason

@@ -1,5 +1,10 @@
 # Changes
 
+## 2026-11-02
+
+- Do not report a backend as `failed` when it was stopped by a router restart. Each loaded deployment records the router instance that launched its process (`process_owner_instance_id`). When reconciliation finds the process gone and that router has exited, the deployment becomes `unloaded` with reason `backend stopped with its router (router restart)` and a `backend.recovery` event with `recovery_result: unloaded_with_router`. A process that dies while its router is alive, or that has no recorded owner, is still `failed`. A router adopts backends that outlived their launching router.
+- Show why a deployment is failed or unloaded: the activity API returns `state_reason`, shown as the status chip tooltip on the activity board; the admin deployments table shows the last transition reason on hover.
+
 ## 2026-11-01
 
 - Add opt-in vLLM sleep/wake orchestration (`sleep` on backends, overridable per deployment): idle sleep after `idle_seconds` (default 10 minutes), wake on demand shared by concurrent requests, level 1 and level 2 wake sequences confirmed by `/is_sleeping`, wake time counted against the interactive timeout, and a cold-restart fallback when a wake fails.

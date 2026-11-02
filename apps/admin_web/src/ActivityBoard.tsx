@@ -9,10 +9,13 @@ type DeploymentActivity = {
   id: string; state: string; gpu_group_id: string | null;
   sleep_enabled?: boolean; can_sleep?: boolean; slept_at?: string | null;
   port?: number | null; kv_used_bytes?: number | null; kv_limit_bytes?: number | null;
+  state_reason?: string | null;
 };
 const kvTitle = (d: DeploymentActivity) => typeof d.kv_used_bytes === "number"
   ? `KV cache in use: ${(d.kv_used_bytes / 1024 ** 3).toFixed(1)} GiB${typeof d.kv_limit_bytes === "number" && d.kv_limit_bytes > 0 ? ` of ${(d.kv_limit_bytes / 1024 ** 3).toFixed(1)} GiB` : ""}`
   : undefined;
+// Hover text: why a deployment is failed/unloaded, else its KV cache usage.
+const chipTitle = (d: DeploymentActivity) => d.state_reason ?? kvTitle(d);
 type Activity = {
   generated_at: string; in_flight: number; waiting: number; loading: number;
   models: Array<{
@@ -197,7 +200,7 @@ export default function ActivityBoard() {
       {activity.data?.models.map(row => <details className="model-activity" key={row.model_name}>
         <summary><strong>{row.model_name}</strong>
           <span className="model-deployments">{row.deployments.map(d => <span key={d.id} className="deployment-chip">
-            <span className={`status-pill status-${d.state}`} title={kvTitle(d)}>{d.id}: {stateLabel(d.state)}{d.gpu_group_id ? ` · ${d.gpu_group_id}` : ""}{typeof d.kv_used_bytes === "number" ? ` · KV ${(d.kv_used_bytes / 1024 ** 3).toFixed(1)} GiB` : ""}</span>
+            <span className={`status-pill status-${d.state}`} title={chipTitle(d)}>{d.id}: {stateLabel(d.state)}{d.gpu_group_id ? ` · ${d.gpu_group_id}` : ""}{typeof d.kv_used_bytes === "number" ? ` · KV ${(d.kv_used_bytes / 1024 ** 3).toFixed(1)} GiB` : ""}</span>
             <SleepButton deployment={d} onResult={setControlMessage} />
           </span>)}</span>
           <span className="activity-model-counts"><b>{row.in_flight}</b> in flight · <b>{row.waiting}</b> waiting{row.loading > 0 && ` · ${row.loading} loading`}<small>Oldest wait: {row.waiting ? duration(row.oldest_wait_seconds) : "—"}</small></span>

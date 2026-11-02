@@ -455,6 +455,7 @@ export default function App() {
         desired_state?: string;
         gpu_group_id?: string;
         last_error?: string;
+        last_transition_reason?: string;
         loaded?: boolean;
         selected_gpu_group_id?: string;
         state?: string;
@@ -481,6 +482,7 @@ export default function App() {
         loaded: runtimeState.loaded === true,
         state,
         lastError: String(runtimeState.last_error ?? ""),
+        lastReason: String(runtimeState.last_transition_reason ?? ""),
         sleepEnabled: sleepPolicy?.enabled === true,
         idleSeconds: sleepPolicy?.idle_seconds ?? null,
         sleptAt: runtimeState.slept_at ?? null,
@@ -922,7 +924,7 @@ export default function App() {
                     <span>alias: {row.apiModelName}</span>
                   </div>
                   <div>
-                    <span className={`status-pill status-${row.state}`}>{stateLabel(row.state)}</span>
+                    <span className={`status-pill status-${row.state}`} title={row.lastReason || undefined}>{stateLabel(row.state)}</span>
                     <span>desired: {row.desiredState}</span>
                     {row.loaded ? (
                       <span>
