@@ -30,6 +30,7 @@ from shardon_core.backends.base import (
     BackendBinaryResponse,
     BackendOperationError,
     UploadedFilePayload,
+    backend_client_error,
     is_backend_connection_error,
 )
 from shardon_core.backends.registry import BackendRegistry
@@ -820,10 +821,27 @@ class ShardonRuntime:
         return await self._route_interactive(
             "chat",
             request.model,
-            request.model_dump(mode="json"),
+            request.backend_payload(),
             auth,
             required_capability="text",
         )
+
+    async def stream_chat(
+        self,
+        request: ChatCompletionRequest,
+        auth: AuthResult,
+    ) -> AsyncIterator[bytes]:
+        async with aclosing(
+            self._route_interactive_stream(
+                "chat",
+                request.model,
+                request.backend_payload(),
+                auth,
+                required_capability="text",
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def route_completion(
         self,
@@ -1510,17 +1528,23 @@ class ShardonRuntime:
                         error,
                     )
                 )
+                detail = {
+                    "error": "backend request failed",
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": target_gpu_group_id,
+                    "detail": error,
+                    "recovery_attempts": recovery_attempts,
+                }
+                status_code = 409
+                client_error = backend_client_error(exc)
+                if client_error is not None:
+                    status_code, detail["backend_response"] = client_error
+                    detail["error"] = "backend rejected request"
                 raise RuntimeOperationError(
                     "backend request failed",
-                    detail={
-                        "error": "backend request failed",
-                        "deployment_id": deployment.id,
-                        "backend_runtime_id": deployment.backend_runtime_id,
-                        "gpu_group_id": target_gpu_group_id,
-                        "detail": error,
-                        "recovery_attempts": recovery_attempts,
-                    },
-                    status_code=409,
+                    detail=detail,
+                    status_code=status_code,
                 ) from exc
 
     async def _invoke_backend_request(
@@ -1577,9 +1601,9 @@ class ShardonRuntime:
         should_wake: bool = False,
         deadline: float | None = None,
     ) -> AsyncIterator[bytes]:
-        if task not in {"response", "completion"}:
+        if task not in {"chat", "response", "completion"}:
             raise RuntimeOperationError(
-                "streaming is only implemented for responses and completions",
+                "streaming is only implemented for chat, responses and completions",
                 detail={"error": "unsupported streaming task", "task": task},
                 status_code=409,
             )
@@ -1609,11 +1633,12 @@ class ShardonRuntime:
         while True:
             adapter = self._deployment_adapter(deployment, target_gpu_group_id)
             try:
-                stream = (
-                    adapter.stream_response(payload)
-                    if task == "response"
-                    else adapter.stream_completion(payload)
-                )
+                if task == "chat":
+                    stream = adapter.stream_chat(payload)
+                elif task == "response":
+                    stream = adapter.stream_response(payload)
+                else:
+                    stream = adapter.stream_completion(payload)
                 async with aclosing(stream):
                     async for chunk in stream:
                         sent_any_chunk = True
@@ -1686,18 +1711,24 @@ class ShardonRuntime:
                         error,
                     )
                 )
+                detail = {
+                    "error": "backend streaming request failed",
+                    "deployment_id": deployment.id,
+                    "backend_runtime_id": deployment.backend_runtime_id,
+                    "gpu_group_id": target_gpu_group_id,
+                    "detail": error,
+                    "recovery_attempts": recovery_attempts,
+                    "stream_started": sent_any_chunk,
+                }
+                status_code = 409
+                client_error = backend_client_error(exc)
+                if client_error is not None:
+                    status_code, detail["backend_response"] = client_error
+                    detail["error"] = "backend rejected request"
                 raise RuntimeOperationError(
                     "backend streaming request failed",
-                    detail={
-                        "error": "backend streaming request failed",
-                        "deployment_id": deployment.id,
-                        "backend_runtime_id": deployment.backend_runtime_id,
-                        "gpu_group_id": target_gpu_group_id,
-                        "detail": error,
-                        "recovery_attempts": recovery_attempts,
-                        "stream_started": sent_any_chunk,
-                    },
-                    status_code=409,
+                    detail=detail,
+                    status_code=status_code,
                 ) from exc
 
     async def _prepare_dispatch(

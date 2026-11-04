@@ -38,9 +38,58 @@ class ClearQueueRequest(BaseModel):
     batches: bool = False
 
 
+class ChatFunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatToolCall(BaseModel):
+    """A tool call previously emitted by the assistant and replayed by the client."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: ChatFunctionCall
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    role: Literal["system", "developer", "user", "assistant", "tool"]
+    # String, multimodal content parts, or null (assistant turns that only call tools).
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_calls: list[ChatToolCall] | None = None
+    tool_call_id: str | None = None
+
+    # Backend-specific message fields (e.g. reasoning_content) pass through untouched.
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatFunctionDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    strict: bool | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatTool(BaseModel):
+    type: Literal["function"] = "function"
+    function: ChatFunctionDefinition
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatNamedFunction(BaseModel):
+    name: str
+
+
+class ChatNamedToolChoice(BaseModel):
+    type: Literal["function"] = "function"
+    function: ChatNamedFunction
 
 
 class ChatCompletionRequest(BaseModel):
@@ -50,7 +99,24 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     response_format: dict[str, Any] | None = None
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    tools: list[ChatTool] | None = None
+    tool_choice: Literal["none", "auto", "required"] | ChatNamedToolChoice | None = None
+    parallel_tool_calls: bool | None = None
+    stream: bool | None = None
+    stream_options: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+    # Forward every other OpenAI/vLLM sampling field (top_p, stop, seed, logprobs,
+    # chat_template_kwargs, ...) instead of silently dropping it.
+    model_config = ConfigDict(extra="allow")
+
+    def backend_payload(self) -> dict[str, Any]:
+        """Payload for the backend: exactly the fields the client sent.
+
+        ``exclude_unset`` keeps nested defaults such as ``tool_calls: null`` out of
+        replayed messages, which some chat templates treat as "defined".
+        """
+        return self.model_dump(mode="json", exclude_unset=True)
 
 
 class ResponseCreateRequest(BaseModel):

@@ -1,5 +1,15 @@
 # Changes
 
+## 2026-11-04
+
+- Fix tool calling through the router. `/v1/chat/completions` silently dropped every field not in its schema, including `tools`, `tool_choice` and `stream`, and rejected assistant `tool_calls` / tool `tool_call_id` messages. The chat schema now types `tools`, `tool_choice`, `parallel_tool_calls`, tool-call messages, the `developer` role, multimodal/`null` content, and forwards any other OpenAI/vLLM field (`top_p`, `stop`, `seed`, `chat_template_kwargs`, ...). Messages are forwarded exactly as sent, with no injected `null` fields. An invalid `tools`/`tool_choice` now gets a 422.
+- Stream chat completions (`stream: true`) via SSE, so streamed `tool_calls` deltas and `finish_reason` arrive unchanged. Before, streamed chat requests got a single non-streamed JSON body.
+- Return backend 4xx rejections with the backend's status code and body (`backend_response`), e.g. vLLM's "`auto` tool choice requires `--enable-auto-tool-choice`", instead of a generic 409.
+
+## 2026-11-03
+
+- Add a minimal Shardon SVG favicon: a mint S-shaped routing path with a bright active-model node, using the dashboard palette. Wire it into the admin UI with a base-aware URL for development and production builds.
+
 ## 2026-11-02
 
 - Do not report a backend as `failed` when it was stopped by a router restart. Each loaded deployment records the router instance that launched its process (`process_owner_instance_id`). When reconciliation finds the process gone and that router has exited, the deployment becomes `unloaded` with reason `backend stopped with its router (router restart)` and a `backend.recovery` event with `recovery_result: unloaded_with_router`. A process that dies while its router is alive, or that has no recorded owner, is still `failed`. A router adopts backends that outlived their launching router.

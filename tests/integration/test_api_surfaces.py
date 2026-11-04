@@ -481,6 +481,151 @@ def test_chat_route_forwards_output_and_reasoning_options(tmp_path: Path, monkey
         assert captured[-1]["reasoning_effort"] == effort
 
 
+def _router_with_key(tmp_path: Path, monkeypatch, key_id: str):
+    repo_root = _make_repo_copy(tmp_path)
+    monkeypatch.setenv("SHARDON_REPO_ROOT", str(repo_root))
+    from shardon_router_api.main import create_app as create_router_app
+
+    api_keys = APIKeyService(repo_root / "state", EventLogger(repo_root / "state"))
+    _, secret = api_keys.create_key(
+        key_id=key_id, user_name="alice", priority=100,
+        permissions=["inference"], actor="admin",
+    )
+    return create_router_app(), {"Authorization": f"Bearer {secret}"}
+
+
+def test_chat_route_forwards_tool_calling_fields(tmp_path: Path, monkeypatch) -> None:
+    app, headers = _router_with_key(tmp_path, monkeypatch, "chat-tools")
+    captured = []
+
+    async def capture(task, model_name, payload, auth, **kwargs):
+        captured.append(payload)
+        return {
+            "id": "chat-tools-ok",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_2", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+
+    app.state.runtime._route_interactive = capture
+    client = TestClient(app)
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }]
+    messages = [
+        {"role": "developer", "content": "Use tools."},
+        {"role": "user", "content": [{"type": "text", "text": "Weather in Vienna?"}]},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city":"Vienna"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "12C"},
+    ]
+    tool_choices = [
+        "auto", "required", "none", {"type": "function", "function": {"name": "get_weather"}},
+    ]
+    for tool_choice in tool_choices:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "demo-chat",
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": False,
+                "top_p": 0.9,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        assert response.status_code == 200, response.text
+        forwarded = captured[-1]
+        assert forwarded["tools"] == tools
+        assert forwarded["tool_choice"] == tool_choice
+        assert forwarded["parallel_tool_calls"] is False
+        assert forwarded["top_p"] == 0.9
+        assert forwarded["chat_template_kwargs"] == {"enable_thinking": False}
+        # Messages are replayed exactly; no injected null tool_calls/name fields.
+        assert forwarded["messages"] == messages
+        assert "metadata" not in forwarded
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["tool_calls"][0]["id"] == "call_2"
+
+
+def test_chat_route_rejects_invalid_tool_fields(tmp_path: Path, monkeypatch) -> None:
+    app, headers = _router_with_key(tmp_path, monkeypatch, "chat-tools-invalid")
+
+    async def unreachable(*args, **kwargs):
+        raise AssertionError("invalid tool payload must not reach the backend")
+
+    app.state.runtime._route_interactive = unreachable
+    client = TestClient(app)
+    base = {"model": "demo-chat", "messages": [{"role": "user", "content": "hi"}]}
+    for extra in [
+        {"tool_choice": "sometimes"},
+        {"tools": "not-a-list"},
+        {"tools": [{"type": "function", "function": {"description": "no name"}}]},
+    ]:
+        response = client.post("/v1/chat/completions", headers=headers, json={**base, **extra})
+        assert response.status_code == 422, (extra, response.text)
+
+
+def test_chat_route_streams_backend_events(tmp_path: Path, monkeypatch) -> None:
+    app, headers = _router_with_key(tmp_path, monkeypatch, "chat-stream")
+
+    async def fake_stream_chat(payload, auth):  # type: ignore[no-untyped-def]
+        _ = auth
+        dumped = payload.backend_payload()
+        assert dumped["stream"] is True
+        assert dumped["tools"][0]["function"]["name"] == "lookup"
+        yield (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+            b'"function":{"name":"lookup","arguments":"{}"}}]}}]}\n\n'
+        )
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    app.state.runtime.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+    client = TestClient(app)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": "demo-chat",
+            "messages": [{"role": "user", "content": "ping"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = b"".join(response.iter_bytes())
+
+    assert b'"tool_calls"' in body
+    assert b'"finish_reason":"tool_calls"' in body
+    assert body.endswith(b"data: [DONE]\n\n")
+
+
 def test_activity_and_usage_are_public_filtered_and_read_only(tmp_path, monkeypatch):
     from shardon_admin_api.main import create_app
     from shardon_core.services.observability import TokenUsage

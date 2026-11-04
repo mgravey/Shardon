@@ -214,6 +214,8 @@ core.*
 # Admin dashboard dependencies/build metadata and local usage accounting (actual/requested models).
 node_modules/
 *.tsbuildinfo
+# Keep the dashboard's source favicon in version control.
+!/apps/admin_web/public/favicon.svg
 state/usage/
 # Router lifetime lock witnesses are local observed state, retained across restarts.
 state/routers/

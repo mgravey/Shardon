@@ -4,7 +4,11 @@ import json
 import httpx
 import pytest
 from pydantic import ValidationError
-from shardon_core.backends.base import OpenAIHTTPBackendAdapter, is_backend_connection_error
+from shardon_core.backends.base import (
+    OpenAIHTTPBackendAdapter,
+    backend_client_error,
+    is_backend_connection_error,
+)
 from shardon_core.config.schemas import BackendRuntimeConfig, BackendRuntimeOverride
 
 
@@ -96,3 +100,67 @@ def test_backend_connection_error_classification(error_type, recover, wrapped) -
         wrapper.__cause__ = error
         error = wrapper
     assert is_backend_connection_error(error) is recover
+
+
+def _mock_transport(monkeypatch, handle) -> None:
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        "shardon_core.backends.base.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handle), **kwargs),
+    )
+
+
+def test_chat_stream_forwards_tool_payload_and_tool_call_deltas(monkeypatch) -> None:
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+    frames = [
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        b'"function":{"name":"lookup","arguments":""}}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        body = json.loads(request.content)
+        assert body["tools"] == tools
+        assert body["tool_choice"] == "auto"
+        assert body["stream"] is True
+        return httpx.Response(200, content=b"".join(frames))
+
+    _mock_transport(monkeypatch, handle)
+    adapter = OpenAIHTTPBackendAdapter(_backend())
+
+    async def collect() -> bytes:
+        payload = {"model": "m", "messages": [], "tools": tools, "tool_choice": "auto",
+                   "stream": True}
+        return b"".join([chunk async for chunk in adapter.stream_chat(payload)])
+
+    body = asyncio.run(collect())
+    assert b'"tool_calls"' in body
+    assert b'"finish_reason":"tool_calls"' in body
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_backend_client_errors_keep_backend_body(monkeypatch, streaming) -> None:
+    error = {"error": {"message": '"auto" tool choice requires --enable-auto-tool-choice'}}
+    _mock_transport(monkeypatch, lambda request: httpx.Response(400, json=error))
+    adapter = OpenAIHTTPBackendAdapter(_backend())
+
+    async def call() -> None:
+        if streaming:
+            async for _ in adapter.stream_chat({"model": "m"}):
+                pass
+        else:
+            await adapter.invoke_chat({"model": "m"})
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        asyncio.run(call())
+    assert backend_client_error(caught.value) == (400, error)
+
+
+def test_backend_server_errors_are_not_client_errors() -> None:
+    request = httpx.Request("POST", "http://backend.test/v1/chat/completions")
+    response = httpx.Response(500, json={"error": "boom"}, request=request)
+    exc = httpx.HTTPStatusError("boom", request=request, response=response)
+    assert backend_client_error(exc) is None
+    assert backend_client_error(RuntimeError("x")) is None
