@@ -1,5 +1,9 @@
 # Changes
 
+## 2026-11-03
+
+- Add a minimal Shardon SVG favicon: a mint S-shaped routing path with a bright active-model node, using the dashboard palette. Wire it into the admin UI with a base-aware URL for development and production builds.
+
 ## 2026-11-02
 
 - Do not report a backend as `failed` when it was stopped by a router restart. Each loaded deployment records the router instance that launched its process (`process_owner_instance_id`). When reconciliation finds the process gone and that router has exited, the deployment becomes `unloaded` with reason `backend stopped with its router (router restart)` and a `backend.recovery` event with `recovery_result: unloaded_with_router`. A process that dies while its router is alive, or that has no recorded owner, is still `failed`. A router adopts backends that outlived their launching router.

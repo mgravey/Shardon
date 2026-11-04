@@ -30,6 +30,14 @@ Shardon is a Linux-first self-hosted LLM router and admin platform built for con
 - [demo](demo)
 - [docs](docs)
 
+## Project Icon
+
+The dashboard favicon lives at [apps/admin_web/public/favicon.svg](apps/admin_web/public/favicon.svg).
+Its mint S-shaped routing path and bright active-model node represent Shardon's
+model orchestration. The self-contained SVG uses the dashboard palette and a
+32-unit grid for small-size readability. Vite serves it from the public directory
+and copies it into production builds; `index.html` references it using the configured base URL.
+
 ## Install and First Run
 
 Run the commands below from the repository root. The shipped configuration uses
