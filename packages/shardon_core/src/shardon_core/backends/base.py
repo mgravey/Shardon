@@ -23,6 +23,28 @@ class BackendOperationError(RuntimeError):
         self.detail = detail
 
 
+def backend_client_error(exc: BaseException) -> tuple[int, Any] | None:
+    """Return ``(status, body)`` when the backend rejected the request with a 4xx.
+
+    Such errors are the caller's fault (bad tool schema, unsupported
+    ``tool_choice``, context too long, ...) and should reach the client verbatim
+    rather than be masked as a generic router failure.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    response = exc.response
+    if not 400 <= response.status_code < 500:
+        return None
+    try:
+        body: Any = response.json()
+    except Exception:
+        try:
+            body = response.text
+        except httpx.ResponseNotRead:
+            body = None
+    return response.status_code, body
+
+
 def is_backend_connection_error(exc: BaseException) -> bool:
     """Return whether an adapter failure means the backend could not be reached.
 
@@ -296,6 +318,13 @@ class BackendAdapter(ABC):
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def stream_chat(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        _ = payload
+        raise BackendOperationError(
+            "backend does not implement chat streaming",
+            detail={"error": "unsupported chat streaming"},
+        )
+
     @abstractmethod
     async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
@@ -425,39 +454,45 @@ class OpenAIHTTPBackendAdapter(BackendAdapter):
     async def invoke_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/chat/completions", payload)
 
-    async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._post_json("/v1/responses", payload)
-
-    async def stream_response(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+    async def _stream_post(self, path: str, payload: dict[str, Any]) -> AsyncIterator[bytes]:
         async with (
             httpx.AsyncClient(timeout=None) as client,
             client.stream(
                 "POST",
-                f"{self.backend.base_url}/v1/responses",
+                f"{self.backend.base_url}{path}",
                 json=self._clean_payload(payload),
             ) as response,
         ):
+            if response.is_error:
+                # Load the body so the backend's validation message survives
+                # into the router error instead of a bare status line.
+                await response.aread()
             response.raise_for_status()
             async for chunk in response.aiter_bytes():
                 if chunk:
                     yield chunk
+
+    async def stream_chat(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        stream = self._stream_post("/v1/chat/completions", payload)
+        async with contextlib.aclosing(stream):
+            async for chunk in stream:
+                yield chunk
+
+    async def invoke_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._post_json("/v1/responses", payload)
+
+    async def stream_response(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
+        async with contextlib.aclosing(self._stream_post("/v1/responses", payload)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def invoke_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/completions", payload)
 
     async def stream_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
-        async with (
-            httpx.AsyncClient(timeout=None) as client,
-            client.stream(
-                "POST",
-                f"{self.backend.base_url}/v1/completions",
-                json=self._clean_payload(payload),
-            ) as response,
-        ):
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    yield chunk
+        async with contextlib.aclosing(self._stream_post("/v1/completions", payload)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def invoke_embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post_json("/v1/embeddings", payload)
